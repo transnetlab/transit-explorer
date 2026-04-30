@@ -1,0 +1,7 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Dark mode base transitions */
+html { scroll-behavior: smooth; }
+body { transition: background-color .3s, color .3s; }
