@@ -26,6 +26,9 @@ function App() {
   }, []);
   return (
     <HashRouter>
+      <div className="pointer-events-none fixed bottom-2 left-3 z-50 text-xs text-slate-600 opacity-70 dark:text-slate-300">
+        v{__APP_VERSION__}
+      </div>
       <Routes>
         {/* Public routes */}
         <Route path="/" element={<LandingPage />} />

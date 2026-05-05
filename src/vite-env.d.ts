@@ -1,5 +1,7 @@
 /// <reference types="vite/client" />
 
+declare const __APP_VERSION__: string;
+
 interface ImportMetaEnv {
 	readonly VITE_API_PREFERRED?: 'local' | 'official' | string;
 	readonly VITE_LOCAL_HOST?: string;
