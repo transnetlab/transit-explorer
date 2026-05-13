@@ -62,7 +62,7 @@ function App() {
           </ProtectedRoute>
         } />
         <Route path=":city/route-planning" element={
-          <ProtectedRoute>
+          <ProtectedRoute allowDefaultCities>
             <RoutePlanning />
           </ProtectedRoute>
         } />

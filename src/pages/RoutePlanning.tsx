@@ -342,8 +342,8 @@
 
 // export default RoutePlanning;
 import { useMemo, useState, useEffect, useRef } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
-import { MapContainer, TileLayer, Marker, Polyline, Popup, useMapEvents, useMap, Circle, CircleMarker } from 'react-leaflet';
+import { useNavigate, useParams, useLocation } from 'react-router-dom';
+import { MapContainer, TileLayer, Marker, Polyline, Popup, Tooltip, useMapEvents, useMap, Circle, CircleMarker } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
 import { ArrowLeft, MapPin, Navigation, RefreshCcw, Shuffle, Menu, X, Clock, Route as RouteIcon } from 'lucide-react';
@@ -374,6 +374,15 @@ const endIcon = L.icon({
   shadowSize: [41, 41]
 });
 
+const legPinIcon = L.icon({
+  iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-blue.png',
+  shadowUrl: 'https://unpkg.com/leaflet@1.7.1/dist/images/marker-shadow.png',
+  iconSize: [25, 41],
+  iconAnchor: [12, 41],
+  popupAnchor: [1, -34],
+  shadowSize: [41, 41]
+});
+
 type Point = { lat: number | null; lon: number | null };
 
 type RouteOptionKey = '1' | '2' | '3';
@@ -385,6 +394,10 @@ type RouteSegment = {
   mode: RouteSegmentMode;
   label?: string;
   anchor?: [number, number];
+  fromStopId?: string;
+  toStopId?: string;
+  fromCoord?: [number, number];
+  toCoord?: [number, number];
   fromName?: string;
   toName?: string;
   estimatedDuration?: string;
@@ -447,8 +460,48 @@ const makeLegFlagIcon = (tag: 'TRANSIT' | 'WALK', label: string, color: string) 
   return icon;
 };
 
+const isRaptorFixtureEnabled = (): boolean => {
+  // Primarily a dev/testing tool. Allow enabling on localhost even in non-DEV builds
+  // (e.g., Electron packaged app or preview) so it remains testable.
+  const isLocalHost = (() => {
+    try {
+      const h = String(window.location.hostname || '').toLowerCase();
+      return h === 'localhost' || h === '127.0.0.1' || h === '::1';
+    } catch {
+      return false;
+    }
+  })();
+
+  if (!import.meta.env.DEV && !isLocalHost) return false;
+  try {
+    const qs = new URLSearchParams(window.location.search);
+    if (qs.get('raptorFixture') === '1') return true;
+  } catch {
+    // ignore
+  }
+  // HashRouter puts route + query inside the hash, e.g.
+  //   http://localhost:3000/#/austin/route-planning?raptorFixture=1
+  // so we also parse querystring from window.location.hash.
+  try {
+    const hash = String(window.location.hash || '');
+    const qIndex = hash.indexOf('?');
+    if (qIndex >= 0 && qIndex + 1 < hash.length) {
+      const qs = new URLSearchParams(hash.slice(qIndex + 1));
+      if (qs.get('raptorFixture') === '1') return true;
+    }
+  } catch {
+    // ignore
+  }
+  try {
+    return (localStorage.getItem('raptorFixture') || '').trim() === '1';
+  } catch {
+    return false;
+  }
+};
+
 export function RoutePlanning() {
   const navigate = useNavigate();
+  const location = useLocation();
   const { city } = useParams();
   const [source, setSource] = useState<Point>({ lat: null, lon: null });
   const [dest, setDest] = useState<Point>({ lat: null, lon: null });
@@ -498,6 +551,54 @@ export function RoutePlanning() {
   } | null>(null);
   const [calendarRangeLoading, setCalendarRangeLoading] = useState<boolean>(true);
   const didInitCalendarFromRangeRef = useRef<boolean>(false);
+
+  const raptorFixtureEnabled = useMemo(() => isRaptorFixtureEnabled(), [location.search, location.hash]);
+
+  const [floatingCardOffset, setFloatingCardOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const floatingDragRef = useRef<{
+    active: boolean;
+    pointerId: number | null;
+    startClientX: number;
+    startClientY: number;
+    startOffsetX: number;
+    startOffsetY: number;
+  }>({
+    active: false,
+    pointerId: null,
+    startClientX: 0,
+    startClientY: 0,
+    startOffsetX: 0,
+    startOffsetY: 0,
+  });
+
+  useEffect(() => {
+    const onMove = (e: PointerEvent) => {
+      if (!floatingDragRef.current.active) return;
+      if (floatingDragRef.current.pointerId !== null && e.pointerId !== floatingDragRef.current.pointerId) return;
+      const dx = e.clientX - floatingDragRef.current.startClientX;
+      const dy = e.clientY - floatingDragRef.current.startClientY;
+      setFloatingCardOffset({
+        x: floatingDragRef.current.startOffsetX + dx,
+        y: floatingDragRef.current.startOffsetY + dy,
+      });
+    };
+
+    const onUp = (e: PointerEvent) => {
+      if (!floatingDragRef.current.active) return;
+      if (floatingDragRef.current.pointerId !== null && e.pointerId !== floatingDragRef.current.pointerId) return;
+      floatingDragRef.current.active = false;
+      floatingDragRef.current.pointerId = null;
+    };
+
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+    return () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+    };
+  }, []);
 
   const parseDdMmYyyyToDate = (s: string | undefined | null): Date | undefined => {
     const raw = (s || '').trim();
@@ -1170,6 +1271,90 @@ export function RoutePlanning() {
 
   const walkConnectorStyle = { color: 'orange', weight: 3, opacity: 0.9, dashArray: '2 10', lineCap: 'round' as const };
 
+  const normalizeLatLonPair = (p: any): [number, number] | undefined => {
+    const a = Number(p?.[0]);
+    const b = Number(p?.[1]);
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return undefined;
+
+    const absA = Math.abs(a);
+    const absB = Math.abs(b);
+
+    // Most of our backend returns [lat, lon]. Some systems return [lon, lat].
+    // Auto-detect and normalize.
+    const looksLikeLatLon = absA <= 90 && absB <= 180;
+    const looksLikeLonLat = absA <= 180 && absB <= 90;
+    if (looksLikeLatLon) return [a, b];
+    if (looksLikeLonLat) return [b, a];
+    return undefined;
+  };
+
+  const haversineMeters = (a: [number, number], b: [number, number]): number => {
+    const R = 6371000;
+    const toRad = (d: number) => (d * Math.PI) / 180;
+    const lat1 = toRad(a[0]);
+    const lat2 = toRad(b[0]);
+    const dLat = toRad(b[0] - a[0]);
+    const dLon = toRad(b[1] - a[1]);
+    const s1 = Math.sin(dLat / 2);
+    const s2 = Math.sin(dLon / 2);
+    const q = s1 * s1 + Math.cos(lat1) * Math.cos(lat2) * s2 * s2;
+    return 2 * R * Math.asin(Math.min(1, Math.sqrt(q)));
+  };
+
+  // Some backend shapes occasionally include isolated “teleport” points (one point far away
+  // followed immediately by a return near the original location). Those create crazy zigzags
+  // on the map. This removes only obvious isolated spikes without smoothing or reordering.
+  const removeIsolatedSpikes = (path: [number, number][]): [number, number][] => {
+    if (!Array.isArray(path) || path.length < 3) return path;
+
+    const SPIKE_FAR_METERS = 2000;
+    const SPIKE_NEAR_METERS = 200;
+
+    const out: [number, number][] = [];
+    for (let i = 0; i < path.length; i++) {
+      const prev = i > 0 ? path[i - 1] : undefined;
+      const cur = path[i];
+      const next = i + 1 < path.length ? path[i + 1] : undefined;
+
+      if (prev && next) {
+        const dPrevCur = haversineMeters(prev, cur);
+        const dCurNext = haversineMeters(cur, next);
+        const dPrevNext = haversineMeters(prev, next);
+        const isSpike = dPrevCur > SPIKE_FAR_METERS && dCurNext > SPIKE_FAR_METERS && dPrevNext < SPIKE_NEAR_METERS;
+        if (isSpike) continue;
+      }
+
+      const last = out[out.length - 1];
+      if (last && last[0] === cur[0] && last[1] === cur[1]) continue;
+      out.push(cur);
+    }
+    return out;
+  };
+
+  // Render helper: break a polyline into multiple pieces when there’s a large discontinuity.
+  // This avoids drawing a straight line “across town” when the backend provides discontinuous points.
+  const splitPathOnLargeJumps = (path: [number, number][]): [number, number][][] => {
+    if (!Array.isArray(path) || path.length < 2) return [];
+    const MAX_JUMP_METERS = 8000;
+
+    const parts: [number, number][][] = [];
+    let cur: [number, number][] = [path[0]];
+
+    for (let i = 1; i < path.length; i++) {
+      const a = path[i - 1];
+      const b = path[i];
+      const d = haversineMeters(a, b);
+      if (d > MAX_JUMP_METERS) {
+        if (cur.length >= 2) parts.push(cur);
+        cur = [b];
+      } else {
+        cur.push(b);
+      }
+    }
+    if (cur.length >= 2) parts.push(cur);
+    return parts.length ? parts : [path];
+  };
+
   const buildDepartureIso = (date: Date, hhmm: string): string => {
     const [hhRaw, mmRaw] = (hhmm || '00:00').split(':');
     const hh = Math.max(0, Math.min(23, Number(hhRaw) || 0));
@@ -1182,8 +1367,369 @@ export function RoutePlanning() {
     return `${y}-${m}-${d}T${H}:${M}:00`;
   };
 
+  const parseRaptorRootToOptions = (root: any) => {
+    const toNum = (v: any): number | undefined => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : undefined;
+    };
+
+    const stopNameById = new Map<string, string>();
+    const stopCoordById = new Map<string, [number, number]>();
+    for (const s of stops) {
+      const id = String((s as any)?.stop_id ?? '').trim();
+      const name = String((s as any)?.stop_name ?? '').trim();
+      if (id && name) stopNameById.set(id, name);
+
+      const lat = toNum((s as any)?.stop_lat);
+      const lon = toNum((s as any)?.stop_lon);
+      if (id && lat !== undefined && lon !== undefined) {
+        stopCoordById.set(id, [lat, lon]);
+      }
+    }
+
+    const prettyEndpointName = (id: string, fallback: string): string => {
+      const lc = (id || '').trim().toLowerCase();
+      if (lc === 'source') return 'Source';
+      if (lc === 'target') return 'Target';
+      return fallback;
+    };
+
+    const parseDurationSeconds = (raw: any): number | undefined => {
+      if (raw === null || raw === undefined) return undefined;
+      if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+      const s = String(raw).trim().toLowerCase();
+      if (!s) return undefined;
+
+      let hours = 0;
+      let minutes = 0;
+      let seconds = 0;
+      const h = s.match(/([0-9]+)\s*(?:h|hr|hrs|hour|hours)/);
+      const m = s.match(/([0-9]+)\s*(?:m|min|mins|minute|minutes)/);
+      const sec = s.match(/([0-9]+)\s*(?:s|sec|secs|second|seconds)/);
+      if (h) hours = Number(h[1]) || 0;
+      if (m) minutes = Number(m[1]) || 0;
+      if (sec) seconds = Number(sec[1]) || 0;
+
+      const total = hours * 3600 + minutes * 60 + seconds;
+      return total > 0 ? total : undefined;
+    };
+
+    const parseDistanceMeters = (raw: any): number | undefined => {
+      if (raw === null || raw === undefined) return undefined;
+      if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+      const s = String(raw).trim().toLowerCase();
+      if (!s) return undefined;
+
+      let km = 0;
+      let m = 0;
+      const kmMatch = s.match(/([0-9]+(?:\.[0-9]+)?)\s*km/);
+      const mMatch = s.match(/([0-9]+(?:\.[0-9]+)?)\s*m/);
+      if (kmMatch) km = Number(kmMatch[1]) || 0;
+      if (mMatch) m = Number(mMatch[1]) || 0;
+      const total = Math.round(km * 1000 + m);
+      return total > 0 ? total : undefined;
+    };
+
+    const pushSegment = (acc: [number, number][], seg: [number, number][]) => {
+      if (!Array.isArray(seg) || seg.length === 0) return;
+      for (let i = 0; i < seg.length; i++) {
+        const pt = seg[i];
+        if (!pt || !Number.isFinite(pt[0]) || !Number.isFinite(pt[1])) continue;
+        const last = acc[acc.length - 1];
+        if (last && last[0] === pt[0] && last[1] === pt[1]) continue;
+        acc.push(pt);
+      }
+    };
+
+    const formatDuration = (seconds: number): string => {
+      const s = Math.max(0, Math.round(seconds));
+      const hrs = Math.floor(s / 3600);
+      const mins = Math.floor((s % 3600) / 60);
+      if (hrs > 0) return `${hrs} hr ${mins} min`;
+      return `${Math.max(1, mins)} min`;
+    };
+
+    const formatDistance = (meters: number): string => {
+      const m = Math.max(0, Math.round(meters));
+      if (m >= 1000) return `${(m / 1000).toFixed(2)} km`;
+      return `${m} m`;
+    };
+
+    const pickAnchor = (path: [number, number][]): [number, number] | undefined => {
+      if (!Array.isArray(path) || path.length === 0) return undefined;
+      return path[Math.floor(path.length / 2)];
+    };
+
+    const originCoord: [number, number] | undefined =
+      Number.isFinite(source.lat as number) && Number.isFinite(source.lon as number)
+        ? ([source.lat as number, source.lon as number] as [number, number])
+        : undefined;
+    const destinationCoord: [number, number] | undefined =
+      Number.isFinite(dest.lat as number) && Number.isFinite(dest.lon as number)
+        ? ([dest.lat as number, dest.lon as number] as [number, number])
+        : undefined;
+
+    const getLegStartCandidate = (leg: any, fromId?: string): [number, number] | undefined => {
+      const aLat = toNum(leg?.from_stop_lat);
+      const aLon = toNum(leg?.from_stop_lon);
+      if (aLat !== undefined && aLon !== undefined) return [aLat, aLon];
+
+      const stopCoord = fromId ? stopCoordById.get(fromId) : undefined;
+      if (stopCoord) return stopCoord;
+
+      const coords = Array.isArray(leg?.path_coords) ? leg.path_coords : [];
+      const rawPath: [number, number][] = coords
+        .map(normalizeLatLonPair)
+        .filter((p: any): p is [number, number] => Array.isArray(p) && Number.isFinite(p[0]) && Number.isFinite(p[1]));
+      return rawPath.length ? rawPath[0] : undefined;
+    };
+    const getLegEndCandidate = (leg: any, toId?: string): [number, number] | undefined => {
+      const bLat = toNum(leg?.to_stop_lat);
+      const bLon = toNum(leg?.to_stop_lon);
+      if (bLat !== undefined && bLon !== undefined) return [bLat, bLon];
+
+      const stopCoord = toId ? stopCoordById.get(toId) : undefined;
+      if (stopCoord) return stopCoord;
+
+      const coords = Array.isArray(leg?.path_coords) ? leg.path_coords : [];
+      const rawPath: [number, number][] = coords
+        .map(normalizeLatLonPair)
+        .filter((p: any): p is [number, number] => Array.isArray(p) && Number.isFinite(p[0]) && Number.isFinite(p[1]));
+      return rawPath.length ? rawPath[rawPath.length - 1] : undefined;
+    };
+
+    const findNextAvailableCoord = (itineraryObj: any, legKeys: string[], startIdxExclusive: number): [number, number] | undefined => {
+      for (let j = startIdxExclusive + 1; j < legKeys.length; j++) {
+        const legJ = itineraryObj[legKeys[j]];
+        const fromIdJ = String(legJ?.from ?? legJ?.from_stop_id ?? legJ?.from_stop ?? '').trim();
+        const toIdJ = String(legJ?.to ?? legJ?.to_stop_id ?? legJ?.to_stop ?? '').trim();
+        const cStart = getLegStartCandidate(legJ, fromIdJ);
+        if (cStart) return cStart;
+        const cEnd = getLegEndCandidate(legJ, toIdJ);
+        if (cEnd) return cEnd;
+      }
+      return undefined;
+    };
+
+    const legacyCoordsCandidate =
+      (Array.isArray((root as any).path_coords) && (root as any).path_coords) ||
+      (Array.isArray((root as any).path) && (root as any).path) ||
+      (Array.isArray((root as any).coordinates) && (root as any).coordinates) ||
+      null;
+
+    let mappedPath: [number, number][] = [];
+    let info: { estimated_duration: string; total_distance: string } | null = null;
+    const nextOptions: Partial<Record<RouteOptionKey, RouteOption>> = {};
+
+    if (legacyCoordsCandidate) {
+      const basePath: [number, number][] = legacyCoordsCandidate
+        .map(normalizeLatLonPair)
+        .filter((p: any): p is [number, number] => Array.isArray(p) && Number.isFinite(p[0]) && Number.isFinite(p[1]));
+      mappedPath = removeIsolatedSpikes(basePath);
+      info = {
+        estimated_duration: String((root as any).estimated_duration || ''),
+        total_distance: String((root as any).total_distance || ''),
+      };
+
+      nextOptions['1'] = {
+        path: mappedPath,
+        segments: mappedPath.length ? [{ path: mappedPath, mode: 'transit' }] : [],
+        info,
+      };
+    } else {
+      const itineraryKeys = (Object.keys(root || {})
+        .filter((k) => k === '1' || k === '2' || k === '3')
+        .sort((a, b) => Number(a) - Number(b)) as RouteOptionKey[]);
+
+      for (const itineraryKey of itineraryKeys) {
+        const itineraryObj = (root as any)[itineraryKey];
+        if (!itineraryObj || typeof itineraryObj !== 'object') continue;
+
+        const legKeys = Object.keys(itineraryObj)
+          .filter((k) => /^\d+$/.test(k))
+          .sort((a, b) => Number(a) - Number(b));
+        if (legKeys.length === 0) continue;
+
+        const pathAcc: [number, number][] = [];
+        const segments: RouteSegment[] = [];
+
+        let totalSeconds = 0;
+        let totalMeters = 0;
+        let hadAnyDuration = false;
+        let hadAnyDistance = false;
+
+        for (let idx = 0; idx < legKeys.length; idx++) {
+          const lk = legKeys[idx];
+          const leg = itineraryObj[lk];
+          const nextLeg = idx + 1 < legKeys.length ? itineraryObj[legKeys[idx + 1]] : undefined;
+
+          const modeRaw = String(leg?.mode || '').trim().toLowerCase();
+          const segmentMode: RouteSegmentMode =
+            modeRaw === 'transit' ? 'transit' : modeRaw === 'walk' ? 'walk' : 'unknown';
+
+          const fromId = String(leg?.from ?? leg?.from_stop_id ?? leg?.from_stop ?? '').trim();
+          const toId = String(leg?.to ?? leg?.to_stop_id ?? leg?.to_stop ?? '').trim();
+          const fromNameFallback =
+            String(leg?.from_stop_name || '').trim() ||
+            stopNameById.get(fromId) ||
+            (fromId ? `Stop ${fromId}` : '');
+          const toNameFallback =
+            String(leg?.to_stop_name || '').trim() ||
+            stopNameById.get(toId) ||
+            (toId ? `Stop ${toId}` : '');
+          const fromName = prettyEndpointName(fromId, fromNameFallback);
+          const toName = prettyEndpointName(toId, toNameFallback);
+
+          const departTimeRaw = String(leg?.from_arrival_time || '').trim();
+          const arriveTimeRaw = String(leg?.to_arrival_time || '').trim();
+
+          const legSec =
+            parseDurationSeconds(leg?.estimated_duration) ??
+            parseDurationSeconds(leg?.path_estimated_duration);
+          const derivedLegSec = legSec !== undefined ? legSec : diffSecondsFromApiTimes(departTimeRaw, arriveTimeRaw);
+          if (derivedLegSec !== undefined) {
+            totalSeconds += derivedLegSec;
+            hadAnyDuration = true;
+          }
+
+          const legMeters =
+            parseDistanceMeters(leg?.estimated_distance) ??
+            parseDistanceMeters(leg?.path_total_distance);
+          if (legMeters !== undefined) {
+            totalMeters += legMeters;
+            hadAnyDistance = true;
+          }
+
+          const coords = Array.isArray(leg?.path_coords) ? leg.path_coords : [];
+          const rawPathBase: [number, number][] = coords
+            .map(normalizeLatLonPair)
+            .filter((p: any): p is [number, number] => Array.isArray(p) && Number.isFinite(p[0]) && Number.isFinite(p[1]));
+          const rawPath: [number, number][] = removeIsolatedSpikes(rawPathBase);
+
+          const explicitStart = getLegStartCandidate(leg, fromId);
+          const explicitEnd = getLegEndCandidate(leg, toId);
+          const nextFromId = nextLeg ? String(nextLeg?.from ?? nextLeg?.from_stop_id ?? nextLeg?.from_stop ?? '').trim() : '';
+          const nextStart = nextLeg ? getLegStartCandidate(nextLeg, nextFromId) : undefined;
+          const nextAny = findNextAvailableCoord(itineraryObj, legKeys, idx);
+
+          const lastAccPoint = pathAcc.length ? pathAcc[pathAcc.length - 1] : undefined;
+          const fallbackStart = explicitStart ?? lastAccPoint ?? (idx === 0 ? originCoord : undefined);
+          const fallbackEnd =
+            explicitEnd ??
+            nextStart ??
+            nextAny ??
+            (idx === legKeys.length - 1 ? destinationCoord : undefined);
+
+          let segPath: [number, number][] = [];
+          if (segmentMode === 'transit') {
+            // Prefer backend geometry; otherwise draw a straight connector between inferred endpoints.
+            if (rawPath.length >= 2) segPath = rawPath;
+            else if (fallbackStart && fallbackEnd) segPath = [fallbackStart, fallbackEnd];
+          } else if (segmentMode === 'walk') {
+            // Walk: if backend provides geometry, draw it accurately.
+            // Otherwise, fall back to a straight connector.
+            if (rawPath.length >= 2) segPath = rawPath;
+            else if (fallbackStart && fallbackEnd) segPath = [fallbackStart, fallbackEnd];
+          } else {
+            if (rawPath.length >= 2) segPath = rawPath;
+            else if (fallbackStart && fallbackEnd) segPath = [fallbackStart, fallbackEnd];
+          }
+
+          if (segPath.length >= 2) {
+            pushSegment(pathAcc, segPath);
+            const label =
+              segmentMode === 'transit'
+                ? String(leg?.route_name || leg?.route || 'Transit')
+                : segmentMode === 'walk'
+                  ? 'Walk'
+                  : 'Leg';
+
+            // Important: Stop pin coordinates must correspond to the stop itself.
+            // If we don't have a real coordinate for the stop (via stop list or path geometry),
+            // do NOT infer it from fallback segment geometry.
+            const fromCoord: [number, number] | undefined = explicitStart;
+            const toCoord: [number, number] | undefined = explicitEnd;
+
+            const durationText = String(leg?.estimated_duration || '').trim() || (derivedLegSec !== undefined ? formatDuration(derivedLegSec) : '');
+            const distanceText = String(leg?.estimated_distance || '').trim() || (legMeters !== undefined ? formatDistance(legMeters) : '');
+            segments.push({
+              path: segPath,
+              mode: segmentMode,
+              label,
+              anchor: pickAnchor(segPath),
+              fromStopId: fromId || undefined,
+              toStopId: toId || undefined,
+              fromCoord,
+              toCoord,
+              fromName: fromName || undefined,
+              toName: toName || undefined,
+              estimatedDuration: durationText || undefined,
+              estimatedDistance: distanceText || undefined,
+              departTime: departTimeRaw || undefined,
+              arriveTime: arriveTimeRaw || undefined,
+            });
+          }
+        }
+
+        if (pathAcc.length === 0) continue;
+
+        const itineraryInfo = {
+          estimated_duration: hadAnyDuration ? formatDuration(totalSeconds) : '',
+          total_distance: hadAnyDistance ? formatDistance(totalMeters) : '',
+        };
+
+        nextOptions[itineraryKey] = { path: pathAcc, segments, info: itineraryInfo };
+      }
+
+      const picked = (Object.keys(nextOptions) as RouteOptionKey[]).sort((a, b) => Number(a) - Number(b))[0];
+      if (picked) {
+        mappedPath = nextOptions[picked]?.path || [];
+        info = nextOptions[picked]?.info || null;
+      }
+    }
+
+    return { mappedPath, info, nextOptions };
+  };
+
   const planRoute = async () => {
-    if (!bothSet) return;
+    const fixtureEnabled = isRaptorFixtureEnabled();
+    if (!bothSet && !fixtureEnabled) return;
+
+    if (fixtureEnabled) {
+      setLoading(true);
+      setServerError(null);
+      setRouteOptions({});
+      try {
+        const mod = await import('../fixtures/raptorFixture');
+        const root = (mod as any)?.RAPTOR_FIXTURE_SAMPLE || {};
+        const { mappedPath, info, nextOptions } = parseRaptorRootToOptions(root);
+
+        if (!mappedPath.length) throw new Error('Fixture did not include a usable path geometry');
+
+        setRouteOptions(nextOptions);
+        const availableKeys = (Object.keys(nextOptions) as RouteOptionKey[]).sort((a, b) => Number(a) - Number(b));
+        const firstKey = availableKeys[0];
+        const desiredKey: RouteOptionKey | undefined =
+          routeOptionView === 'all' ? firstKey : (routeOptionView as RouteOptionKey);
+        const keyToUse = (desiredKey && nextOptions[desiredKey] ? desiredKey : firstKey) || '1';
+        setRouteInfo(nextOptions[keyToUse]?.info || info);
+
+        // If user hasn't set points, seed them from the rendered option.
+        if (source.lat === null || source.lon === null || dest.lat === null || dest.lon === null) {
+          const ends = getOptionEnds(nextOptions[keyToUse]);
+          if (ends.start) setSource({ lat: ends.start[0], lon: ends.start[1] });
+          if (ends.end) setDest({ lat: ends.end[0], lon: ends.end[1] });
+        }
+      } catch (err: any) {
+        setServerError(err?.message || 'Failed to load fixture route');
+        setRouteInfo(null);
+        setRouteOptions({});
+      } finally {
+        setLoading(false);
+      }
+      return;
+    }
+
     // Strict date availability enforcement
     if (!selectedDate) {
       setServerError('Select a departure date with available service first');
@@ -1262,263 +1808,7 @@ export function RoutePlanning() {
       const json = await runRaptor(payload);
 
       const root = (json && (json.data ?? json.response ?? json)) || {};
-
-      const toNum = (v: any): number | undefined => {
-        const n = Number(v);
-        return Number.isFinite(n) ? n : undefined;
-      };
-
-      const stopNameById = new Map<string, string>();
-      for (const s of stops) {
-        const id = String((s as any)?.stop_id ?? '').trim();
-        const name = String((s as any)?.stop_name ?? '').trim();
-        if (id && name) stopNameById.set(id, name);
-      }
-
-      const parseDurationSeconds = (raw: any): number | undefined => {
-        if (raw === null || raw === undefined) return undefined;
-        if (typeof raw === 'number' && Number.isFinite(raw)) {
-          // If backend ever sends numeric seconds, accept it.
-          return raw;
-        }
-        const s = String(raw).trim().toLowerCase();
-        if (!s) return undefined;
-
-        // Formats seen:
-        // - "4 hr 17 min"
-        // - "54 min 18 s"
-        // - "17 min 23 s"
-        let hours = 0;
-        let minutes = 0;
-        let seconds = 0;
-        const h = s.match(/([0-9]+)\s*(?:h|hr|hrs|hour|hours)/);
-        const m = s.match(/([0-9]+)\s*(?:m|min|mins|minute|minutes)/);
-        const sec = s.match(/([0-9]+)\s*(?:s|sec|secs|second|seconds)/);
-        if (h) hours = Number(h[1]) || 0;
-        if (m) minutes = Number(m[1]) || 0;
-        if (sec) seconds = Number(sec[1]) || 0;
-
-        const total = hours * 3600 + minutes * 60 + seconds;
-        return total > 0 ? total : undefined;
-      };
-
-      const parseDistanceMeters = (raw: any): number | undefined => {
-        if (raw === null || raw === undefined) return undefined;
-        if (typeof raw === 'number' && Number.isFinite(raw)) {
-          // If backend ever sends numeric meters, accept it.
-          return raw;
-        }
-        const s = String(raw).trim().toLowerCase();
-        if (!s) return undefined;
-
-        // Formats seen:
-        // - "3 km 802 m"
-        // - "2 km 433 m"
-        // Also tolerate single-unit strings.
-        let km = 0;
-        let m = 0;
-        const kmMatch = s.match(/([0-9]+(?:\.[0-9]+)?)\s*km/);
-        const mMatch = s.match(/([0-9]+(?:\.[0-9]+)?)\s*m/);
-        if (kmMatch) km = Number(kmMatch[1]) || 0;
-        if (mMatch) {
-          const val = Number(mMatch[1]) || 0;
-          // If string contains km as well, this "m" is meters; otherwise it might be meters.
-          m = val;
-        }
-        const total = Math.round(km * 1000 + m);
-        return total > 0 ? total : undefined;
-      };
-
-      const pushSegment = (acc: [number, number][], seg: [number, number][]) => {
-        if (!Array.isArray(seg) || seg.length === 0) return;
-        for (let i = 0; i < seg.length; i++) {
-          const pt = seg[i];
-          if (!pt || !Number.isFinite(pt[0]) || !Number.isFinite(pt[1])) continue;
-          const last = acc[acc.length - 1];
-          if (last && last[0] === pt[0] && last[1] === pt[1]) continue;
-          acc.push(pt);
-        }
-      };
-
-      // Two possible shapes:
-      // 1) legacy: { path_coords: [[lat,lon], ...], estimated_duration, total_distance }
-      // 2) RAPTOR: { "1": { "1": {mode, path_coords?, from_stop_lat...}, "2": {...} }, "2": {...} }
-      const legacyCoordsCandidate =
-        (Array.isArray((root as any).path_coords) && (root as any).path_coords) ||
-        (Array.isArray((root as any).path) && (root as any).path) ||
-        (Array.isArray((root as any).coordinates) && (root as any).coordinates) ||
-        null;
-
-      let mappedPath: [number, number][] = [];
-      let info: { estimated_duration: string; total_distance: string } | null = null;
-      const nextOptions: Partial<Record<RouteOptionKey, RouteOption>> = {};
-
-      if (legacyCoordsCandidate) {
-        mappedPath = legacyCoordsCandidate
-          .map((p: any) => [Number(p?.[0]), Number(p?.[1])] as [number, number])
-          .filter((p: [number, number]) => Number.isFinite(p[0]) && Number.isFinite(p[1]));
-        info = {
-          estimated_duration: String((root as any).estimated_duration || ''),
-          total_distance: String((root as any).total_distance || ''),
-        };
-
-        nextOptions['1'] = {
-          path: mappedPath,
-          segments: mappedPath.length ? [{ path: mappedPath, mode: 'transit' }] : [],
-          info,
-        };
-      } else {
-        const formatDuration = (seconds: number): string => {
-          const s = Math.max(0, Math.round(seconds));
-          const hrs = Math.floor(s / 3600);
-          const mins = Math.floor((s % 3600) / 60);
-          if (hrs > 0) return `${hrs} hr ${mins} min`;
-          return `${Math.max(1, mins)} min`;
-        };
-
-        const formatDistance = (meters: number): string => {
-          const m = Math.max(0, Math.round(meters));
-          if (m >= 1000) return `${(m / 1000).toFixed(2)} km`;
-          return `${m} m`;
-        };
-
-        const pickAnchor = (path: [number, number][]): [number, number] | undefined => {
-          if (!Array.isArray(path) || path.length === 0) return undefined;
-          return path[Math.floor(path.length / 2)];
-        };
-
-        const itineraryKeys = (Object.keys(root || {})
-          .filter((k) => k === '1' || k === '2' || k === '3')
-          .sort((a, b) => Number(a) - Number(b)) as RouteOptionKey[]);
-
-        for (const itineraryKey of itineraryKeys) {
-          const itineraryObj = (root as any)[itineraryKey];
-          if (!itineraryObj || typeof itineraryObj !== 'object') continue;
-
-          const legKeys = Object.keys(itineraryObj)
-            .filter((k) => /^\d+$/.test(k))
-            .sort((a, b) => Number(a) - Number(b));
-
-          // Skip empty itineraries like "1": {}
-          if (legKeys.length === 0) continue;
-
-          const pathAcc: [number, number][] = [];
-          const segments: RouteSegment[] = [];
-
-          let totalSeconds = 0;
-          let totalMeters = 0;
-          let hadAnyDuration = false;
-          let hadAnyDistance = false;
-
-          for (const lk of legKeys) {
-            const leg = itineraryObj[lk];
-            const modeRaw = String(leg?.mode || '').trim().toLowerCase();
-            const segmentMode: RouteSegmentMode =
-              modeRaw === 'transit' ? 'transit' : modeRaw === 'walk' ? 'walk' : 'unknown';
-
-            const fromId = String(leg?.from ?? leg?.from_stop_id ?? leg?.from_stop ?? '').trim();
-            const toId = String(leg?.to ?? leg?.to_stop_id ?? leg?.to_stop ?? '').trim();
-            const fromName =
-              String(leg?.from_stop_name || '').trim() ||
-              stopNameById.get(fromId) ||
-              (fromId ? `Stop ${fromId}` : '');
-            const toName =
-              String(leg?.to_stop_name || '').trim() ||
-              stopNameById.get(toId) ||
-              (toId ? `Stop ${toId}` : '');
-
-            const departTimeRaw = String(leg?.from_arrival_time || '').trim();
-            const arriveTimeRaw = String(leg?.to_arrival_time || '').trim();
-
-            const legSec =
-              parseDurationSeconds(leg?.estimated_duration) ??
-              parseDurationSeconds(leg?.path_estimated_duration);
-            const derivedLegSec = legSec !== undefined ? legSec : diffSecondsFromApiTimes(departTimeRaw, arriveTimeRaw);
-            if (derivedLegSec !== undefined) {
-              totalSeconds += derivedLegSec;
-              hadAnyDuration = true;
-            }
-
-            const legMeters =
-              parseDistanceMeters(leg?.estimated_distance) ??
-              parseDistanceMeters(leg?.path_total_distance);
-            if (legMeters !== undefined) {
-              totalMeters += legMeters;
-              hadAnyDistance = true;
-            }
-
-            const coords = Array.isArray(leg?.path_coords) ? leg.path_coords : [];
-            const rawPath: [number, number][] = coords
-              .map((p: any) => [Number(p?.[0]), Number(p?.[1])] as [number, number])
-              .filter((p: [number, number]) => Number.isFinite(p[0]) && Number.isFinite(p[1]));
-
-            const aLat = toNum(leg?.from_stop_lat);
-            const aLon = toNum(leg?.from_stop_lon);
-            const bLat = toNum(leg?.to_stop_lat);
-            const bLon = toNum(leg?.to_stop_lon);
-            const endpointsPath: [number, number][] =
-              aLat !== undefined && aLon !== undefined && bLat !== undefined && bLon !== undefined
-                ? ([
-                    [aLat, aLon],
-                    [bLat, bLon],
-                  ] as [number, number][])
-                : [];
-
-            let segPath: [number, number][] = [];
-            if (segmentMode === 'transit') {
-              // Transit: draw the full polyline from backend; fall back to straight line between stops.
-              segPath = rawPath.length >= 2 ? rawPath : endpointsPath;
-            } else {
-              // Walk: draw straight line (endpoints only).
-              if (rawPath.length >= 2) {
-                segPath = [rawPath[0], rawPath[rawPath.length - 1]];
-              } else {
-                segPath = endpointsPath;
-              }
-            }
-
-            if (segPath.length >= 2) {
-              pushSegment(pathAcc, segPath);
-              const label =
-                segmentMode === 'transit'
-                  ? String(leg?.route_name || leg?.route || 'Transit')
-                  : segmentMode === 'walk'
-                    ? 'Walk'
-                    : 'Leg';
-
-              const durationText = String(leg?.estimated_duration || '').trim() || (derivedLegSec !== undefined ? formatDuration(derivedLegSec) : '');
-              const distanceText = String(leg?.estimated_distance || '').trim() || (legMeters !== undefined ? formatDistance(legMeters) : '');
-              segments.push({
-                path: segPath,
-                mode: segmentMode,
-                label,
-                anchor: pickAnchor(segPath),
-                fromName: fromName || undefined,
-                toName: toName || undefined,
-                estimatedDuration: durationText || undefined,
-                estimatedDistance: distanceText || undefined,
-                departTime: departTimeRaw || undefined,
-                arriveTime: arriveTimeRaw || undefined,
-              });
-            }
-          }
-
-          if (pathAcc.length === 0) continue;
-
-          const itineraryInfo = {
-            estimated_duration: hadAnyDuration ? formatDuration(totalSeconds) : '',
-            total_distance: hadAnyDistance ? formatDistance(totalMeters) : '',
-          };
-
-          nextOptions[itineraryKey] = { path: pathAcc, segments, info: itineraryInfo };
-        }
-
-        const picked = (Object.keys(nextOptions) as RouteOptionKey[]).sort((a, b) => Number(a) - Number(b))[0];
-        if (picked) {
-          mappedPath = nextOptions[picked]?.path || [];
-          info = nextOptions[picked]?.info || null;
-        }
-      }
+      const { mappedPath, info, nextOptions } = parseRaptorRootToOptions(root);
 
       if (mappedPath.length === 0) {
         console.warn('[run-raptor] Response did not include a usable path geometry', json);
@@ -2050,109 +2340,6 @@ export function RoutePlanning() {
               </div>
             </div>
 
-            {routeOptionKeys.length > 0 && (
-              <div className="mb-4 p-4 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg shadow-sm">
-                <label className="block text-xs font-medium text-gray-600 dark:text-gray-300 mb-2">Route option</label>
-                <select
-                  value={routeOptionView}
-                  onChange={(e) => setRouteOptionView(e.target.value as RouteOptionView)}
-                  className="w-full px-3 py-2 border rounded-lg text-sm bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                >
-                  {routeOptionKeys.length > 1 && <option value="all">All (1/2/3)</option>}
-                  {routeOptionKeys.includes('1') && <option value="1">Option 1</option>}
-                  {routeOptionKeys.includes('2') && <option value="2">Option 2</option>}
-                  {routeOptionKeys.includes('3') && <option value="3">Option 3</option>}
-                </select>
-                {routeOptionKeys.length > 1 && (
-                  <div className="mt-2 flex flex-wrap gap-3 text-xs text-gray-700 dark:text-gray-300">
-                    {routeOptionKeys.includes('1') && (
-                      <div className="flex items-center gap-2">
-                        <span className="inline-block h-2 w-2 rounded-full bg-blue-600" />
-                        Option 1
-                      </div>
-                    )}
-                    {routeOptionKeys.includes('2') && (
-                      <div className="flex items-center gap-2">
-                        <span className="inline-block h-2 w-2 rounded-full bg-pink-700" />
-                        Option 2
-                      </div>
-                    )}
-                    {routeOptionKeys.includes('3') && (
-                      <div className="flex items-center gap-2">
-                        <span className="inline-block h-2 w-2 rounded-full bg-green-600" />
-                        Option 3
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {routeInfo && (
-              <div className="mb-4 p-4 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg shadow-sm">
-                <h2 className="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-3">Estimated Trip</h2>
-                <div className="flex flex-wrap gap-4 text-sm text-gray-800 dark:text-gray-200">
-                  <div className="flex items-center"><Clock size={16} className="mr-2 text-blue-600" />{routeInfo.estimated_duration}</div>
-                  <div className="flex items-center"><RouteIcon size={16} className="mr-2 text-blue-600" />{routeInfo.total_distance}</div>
-                  {etaString && (
-                    <div className="flex items-center"><Clock size={16} className="mr-2 text-blue-600" />ETA {etaString}</div>
-                  )}
-                </div>
-              </div>
-            )}
-
-            {routeOptionKeys.length > 0 && (
-              <div className="mb-4 p-4 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg shadow-sm">
-                <div className="flex items-center justify-between mb-2">
-                  <h2 className="text-sm font-semibold text-gray-800 dark:text-gray-200">Directions</h2>
-                  {routeOptionView !== 'all' && selectedRouteOptionKey && (
-                    (() => {
-                      const a = getOptionAccent(selectedRouteOptionKey);
-                      return (
-                        <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold ${a.chipBg} ${a.text}`}>
-                          Option {selectedRouteOptionKey}
-                        </span>
-                      );
-                    })()
-                  )}
-                </div>
-                {routeOptionView === 'all' ? (
-                  <div className="space-y-3">
-                    {routeOptionKeys.map((k) => {
-                      const opt = routeOptions[k];
-                      const segs = opt?.segments || [];
-                      if (!segs.length) return null;
-                      const accent = getOptionAccent(k);
-                      return (
-                        <div key={`legs-${k}`}>
-                          <div className="flex items-center gap-2 mb-1">
-                            <span className={`inline-block h-2 w-2 rounded-full ${k === '1' ? 'bg-blue-600' : k === '2' ? 'bg-pink-700' : 'bg-green-600'}`} />
-                            <div className={`text-xs font-semibold ${accent.text}`}>Option {k}</div>
-                          </div>
-                          <div className="rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 px-2">
-                            {segs.map((s, idx) => renderLegRow(s, idx, segs.length, accent))}
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                ) : (
-                  (() => {
-                    const k = selectedRouteOptionKey;
-                    const segs = k ? (routeOptions[k]?.segments || []) : [];
-                    const accent = getOptionAccent(k);
-                    return (
-                      <div className="rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 px-2">
-                        {segs.length ? segs.map((s, idx) => renderLegRow(s, idx, segs.length, accent)) : (
-                          <div className="text-xs text-gray-600 dark:text-gray-300 py-2">No legs available for this option.</div>
-                        )}
-                      </div>
-                    );
-                  })()
-                )}
-              </div>
-            )}
-
             <div className="space-y-4">
               <div>
                 <label className="text-sm font-medium text-gray-700 dark:text-gray-200">Source (lat, lon)</label>
@@ -2247,18 +2434,24 @@ export function RoutePlanning() {
                 )}
               </div>
 
-              {bothSet && (
+              {(bothSet || raptorFixtureEnabled) && (
                 <div className="mt-3 p-3 rounded-md bg-green-50 dark:bg-green-900/30 text-green-700 dark:text-green-300 text-sm">
                   <div className="font-medium mb-1 flex items-center">
-                    <Navigation size={16} className="mr-2" /> Points ready
+                    <Navigation size={16} className="mr-2" /> {raptorFixtureEnabled && !bothSet ? 'Fixture ready' : 'Points ready'}
                   </div>
-                  <div>Source: {source.lat?.toFixed(6)}, {source.lon?.toFixed(6)}</div>
-                  <div>Destination: {dest.lat?.toFixed(6)}, {dest.lon?.toFixed(6)}</div>
+                  {bothSet ? (
+                    <>
+                      <div>Source: {source.lat?.toFixed(6)}, {source.lon?.toFixed(6)}</div>
+                      <div>Destination: {dest.lat?.toFixed(6)}, {dest.lon?.toFixed(6)}</div>
+                    </>
+                  ) : (
+                    <div className="text-xs opacity-90">Loads the hardcoded RAPTOR result (dev-only).</div>
+                  )}
                     <button
                       type="button"
                       onClick={planRoute}
                       className="mt-3 inline-flex items-center px-4 py-2 rounded-lg text-sm font-medium text-white bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
-                      disabled={loading || !selectedDate || !serviceAvailability[`${selectedDate.getFullYear()}${String(selectedDate.getMonth()+1).padStart(2,'0')}${String(selectedDate.getDate()).padStart(2,'0')}`]}
+                      disabled={raptorFixtureEnabled ? loading : (loading || !selectedDate || !serviceAvailability[`${selectedDate.getFullYear()}${String(selectedDate.getMonth()+1).padStart(2,'0')}${String(selectedDate.getDate()).padStart(2,'0')}`])}
                     >
                       {loading ? (
                         <span className="flex items-center"><span className="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2"></span>Planning…</span>
@@ -2276,6 +2469,7 @@ export function RoutePlanning() {
 
       {/* Map side */}
       <div className={`
+        relative
         flex-1
         h-screen
         transition-[margin]
@@ -2287,11 +2481,150 @@ export function RoutePlanning() {
             <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500"></div>
           </div>
         )}
-        {serverError && (
-          <div className="absolute top-4 right-4 z-20 bg-red-50 border border-red-200 text-red-700 rounded-lg px-3 py-2 text-sm shadow">
-            {serverError}
-          </div>
-        )}
+        <div className="absolute top-4 right-4 z-[1000] flex flex-col gap-3 w-[22rem] max-w-[calc(100vw-2rem)] pointer-events-auto">
+          {serverError && (
+            <div className="bg-red-50 border border-red-200 text-red-700 rounded-lg px-3 py-2 text-sm shadow">
+              {serverError}
+            </div>
+          )}
+
+          {(routeInfo || routeOptionKeys.length > 0) && (
+            <div
+              className="bg-white/95 dark:bg-gray-900/90 backdrop-blur-sm border border-black dark:border-white/30 rounded-lg shadow text-gray-800 dark:text-gray-200 overflow-hidden max-h-[70vh]"
+              style={{ transform: `translate3d(${floatingCardOffset.x}px, ${floatingCardOffset.y}px, 0)` }}
+            >
+              <div
+                className="px-4 py-2 border-b border-black/20 dark:border-white/20 cursor-move select-none touch-none"
+                onPointerDown={(e) => {
+                  // Only left-click drags with mouse; touch/pen is fine.
+                  if (e.pointerType === 'mouse' && e.button !== 0) return;
+                  floatingDragRef.current.active = true;
+                  floatingDragRef.current.pointerId = e.pointerId;
+                  floatingDragRef.current.startClientX = e.clientX;
+                  floatingDragRef.current.startClientY = e.clientY;
+                  floatingDragRef.current.startOffsetX = floatingCardOffset.x;
+                  floatingDragRef.current.startOffsetY = floatingCardOffset.y;
+                  try {
+                    (e.currentTarget as any).setPointerCapture?.(e.pointerId);
+                  } catch {
+                    // ignore
+                  }
+                  e.preventDefault();
+                }}
+              >
+                <div className="flex items-center justify-between">
+                  <div className="text-xs font-semibold text-gray-700 dark:text-gray-200">Route details</div>
+                  <div className="text-[10px] text-gray-500 dark:text-gray-400">Drag</div>
+                </div>
+              </div>
+
+              <div className="px-4 py-3 overflow-y-auto max-h-[calc(70vh-40px)]">
+              {routeOptionKeys.length > 0 && (
+                <div className="mb-4">
+                  <label className="block text-xs font-medium text-gray-600 dark:text-gray-300 mb-2">Route option</label>
+                  <select
+                    value={routeOptionView}
+                    onChange={(e) => setRouteOptionView(e.target.value as RouteOptionView)}
+                    className="w-full px-3 py-2 border rounded-lg text-sm bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  >
+                    {routeOptionKeys.length > 1 && <option value="all">All (1/2/3)</option>}
+                    {routeOptionKeys.includes('1') && <option value="1">Option 1</option>}
+                    {routeOptionKeys.includes('2') && <option value="2">Option 2</option>}
+                    {routeOptionKeys.includes('3') && <option value="3">Option 3</option>}
+                  </select>
+                  {routeOptionKeys.length > 1 && (
+                    <div className="mt-2 flex flex-wrap gap-3 text-xs text-gray-700 dark:text-gray-300">
+                      {routeOptionKeys.includes('1') && (
+                        <div className="flex items-center gap-2">
+                          <span className="inline-block h-2 w-2 rounded-full bg-blue-600" />
+                          Option 1
+                        </div>
+                      )}
+                      {routeOptionKeys.includes('2') && (
+                        <div className="flex items-center gap-2">
+                          <span className="inline-block h-2 w-2 rounded-full bg-pink-700" />
+                          Option 2
+                        </div>
+                      )}
+                      {routeOptionKeys.includes('3') && (
+                        <div className="flex items-center gap-2">
+                          <span className="inline-block h-2 w-2 rounded-full bg-green-600" />
+                          Option 3
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {routeInfo && (
+                <div className="mb-4">
+                  <h2 className="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">Estimated Trip</h2>
+                  <div className="flex flex-wrap gap-4 text-sm text-gray-800 dark:text-gray-200">
+                    <div className="flex items-center"><Clock size={16} className="mr-2" />{routeInfo.estimated_duration}</div>
+                    <div className="flex items-center"><RouteIcon size={16} className="mr-2" />{routeInfo.total_distance}</div>
+                    {etaString && (
+                      <div className="flex items-center"><Clock size={16} className="mr-2" />ETA {etaString}</div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {routeOptionKeys.length > 0 && (
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <h2 className="text-sm font-semibold text-gray-800 dark:text-gray-200">Directions</h2>
+                    {routeOptionView !== 'all' && selectedRouteOptionKey && (
+                      (() => {
+                        const a = getOptionAccent(selectedRouteOptionKey);
+                        return (
+                          <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold ${a.chipBg} ${a.text}`}>
+                            Option {selectedRouteOptionKey}
+                          </span>
+                        );
+                      })()
+                    )}
+                  </div>
+                  {routeOptionView === 'all' ? (
+                    <div className="space-y-3">
+                      {routeOptionKeys.map((k) => {
+                        const opt = routeOptions[k];
+                        const segs = opt?.segments || [];
+                        if (!segs.length) return null;
+                        const accent = getOptionAccent(k);
+                        return (
+                          <div key={`legs-${k}`}>
+                            <div className="flex items-center gap-2 mb-1">
+                              <span className={`inline-block h-2 w-2 rounded-full ${k === '1' ? 'bg-blue-600' : k === '2' ? 'bg-pink-700' : 'bg-green-600'}`} />
+                              <div className={`text-xs font-semibold ${accent.text}`}>Option {k}</div>
+                            </div>
+                            <div className="rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 px-2">
+                              {segs.map((s, idx) => renderLegRow(s, idx, segs.length, accent))}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    (() => {
+                      const k = selectedRouteOptionKey;
+                      const segs = k ? (routeOptions[k]?.segments || []) : [];
+                      const accent = getOptionAccent(k);
+                      return (
+                        <div className="rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 px-2">
+                          {segs.length ? segs.map((s, idx) => renderLegRow(s, idx, segs.length, accent)) : (
+                            <div className="text-xs text-gray-600 dark:text-gray-300 py-2">No legs available for this option.</div>
+                          )}
+                        </div>
+                      );
+                    })()
+                  )}
+                </div>
+              )}
+              </div>
+            </div>
+          )}
+        </div>
         <div className="absolute top-4 left-4 z-10 bg-white/90 dark:bg-gray-900/80 backdrop-blur-sm border border-gray-200 dark:border-gray-700 rounded-lg shadow px-3 py-2 text-xs text-gray-700 dark:text-gray-200">
           {pickMode ? (
             <div className="flex items-center"><span className="mr-2 inline-block h-2 w-2 rounded-full bg-blue-500"></span>Click the map to set {pickMode === 'source' ? 'Source' : 'Destination'}</div>
@@ -2302,17 +2635,7 @@ export function RoutePlanning() {
             </div>
           )}
         </div>
-        {/* Bottom-left route stats */
-        }
-        {routeInfo && (
-          <div className="absolute bottom-4 left-4 z-10 bg-white/95 dark:bg-gray-900/90 border border-gray-200 dark:border-gray-700 rounded-lg shadow px-4 py-3 text-sm text-gray-800 dark:text-gray-200 flex gap-6">
-            <div className="flex items-center"><Clock size={16} className="mr-2" />{routeInfo.estimated_duration}</div>
-            <div className="flex items-center"><RouteIcon size={16} className="mr-2" />{routeInfo.total_distance}</div>
-            {etaString && (
-              <div className="flex items-center"><Clock size={16} className="mr-2" />ETA {etaString}</div>
-            )}
-          </div>
-        )}
+        {/* Bottom-left route stats removed (now shown in right floating card) */}
         {(() => {
           const mapCenter = dynamicCityCenter ?? cityCenter;
           const nearbyAnchor: [number, number] | null =
@@ -2439,20 +2762,38 @@ export function RoutePlanning() {
                   const opt = routeOptions[k];
                   const segs = opt?.segments || [];
                   const color = ROUTE_OPTION_COLORS[k];
-                  return segs.flatMap((s, idx) => {
+                  const stopPins = new Map<
+                    string,
+                    { coord: [number, number]; name: string }
+                  >();
+
+                  for (const s of segs) {
+                    if (s.fromStopId && s.fromCoord && s.fromName && !stopPins.has(s.fromStopId)) {
+                      stopPins.set(s.fromStopId, { coord: s.fromCoord, name: s.fromName });
+                    }
+                    if (s.toStopId && s.toCoord && s.toName && !stopPins.has(s.toStopId)) {
+                      stopPins.set(s.toStopId, { coord: s.toCoord, name: s.toName });
+                    }
+                  }
+
+                  return [
+                    ...segs.flatMap((s, idx) => {
                     const baseKey = `route-option-${k}-seg-${idx}`;
-                    const items: any[] = [
+                    const pinColor = s.mode === 'walk' ? 'orange' : color;
+                    const parts = splitPathOnLargeJumps(s.path);
+                    const items: any[] = parts.map((p, partIdx) => (
                       <Polyline
-                        key={baseKey}
-                        positions={s.path}
+                        key={`${baseKey}-part-${partIdx}`}
+                        positions={p}
                         pathOptions={{
                           color: s.mode === 'walk' ? 'orange' : color,
                           weight: 4,
                           opacity: 0.85,
                           ...(s.mode === 'walk' ? { dashArray: '2 10', lineCap: 'round' } : {}),
                         }}
-                      />,
-                    ];
+                      />
+                    ));
+
                     if (s.mode === 'transit' && s.anchor) {
                       items.push(
                         <Marker
@@ -2487,7 +2828,22 @@ export function RoutePlanning() {
                       );
                     }
                     return items;
-                  });
+                  }),
+                    ...Array.from(stopPins.entries()).map(([stopId, v]) => (
+                      <Marker
+                        key={`stop-pin-${k}-${stopId}`}
+                        position={v.coord}
+                        icon={legPinIcon}
+                      >
+                        <Tooltip direction="top" offset={[0, -20]} opacity={1}>
+                          <div className="text-xs">
+                            <div className="font-semibold">{stopId}</div>
+                            <div>{v.name}</div>
+                          </div>
+                        </Tooltip>
+                      </Marker>
+                    )),
+                  ];
                 })}
               </>
             ) : (
@@ -2553,20 +2909,36 @@ export function RoutePlanning() {
                       return items;
                     })()}
 
-                    {segs.flatMap((s, idx) => {
+                    {(() => {
+                      const stopPins = new Map<string, { coord: [number, number]; name: string }>();
+                      for (const s of segs) {
+                        if (s.fromStopId && s.fromCoord && s.fromName && !stopPins.has(s.fromStopId)) {
+                          stopPins.set(s.fromStopId, { coord: s.fromCoord, name: s.fromName });
+                        }
+                        if (s.toStopId && s.toCoord && s.toName && !stopPins.has(s.toStopId)) {
+                          stopPins.set(s.toStopId, { coord: s.toCoord, name: s.toName });
+                        }
+                      }
+
+                      return (
+                        <>
+                          {segs.flatMap((s, idx) => {
                       const baseKey = `route-option-${k}-seg-${idx}`;
-                      const items: any[] = [
+                      const pinColor = s.mode === 'walk' ? 'orange' : color;
+                      const parts = splitPathOnLargeJumps(s.path);
+                      const items: any[] = parts.map((p, partIdx) => (
                         <Polyline
-                          key={baseKey}
-                          positions={s.path}
+                          key={`${baseKey}-part-${partIdx}`}
+                          positions={p}
                           pathOptions={{
                             color: s.mode === 'walk' ? 'orange' : color,
                             weight: 4,
                             opacity: 0.85,
                             ...(s.mode === 'walk' ? { dashArray: '2 10', lineCap: 'round' } : {}),
                           }}
-                        />,
-                      ];
+                        />
+                      ));
+
                       if (s.mode === 'transit' && s.anchor) {
                         items.push(
                           <Marker
@@ -2601,7 +2973,25 @@ export function RoutePlanning() {
                         );
                       }
                       return items;
-                    })}
+                          })}
+
+                          {Array.from(stopPins.entries()).map(([stopId, v]) => (
+                            <Marker
+                              key={`stop-pin-${k}-${stopId}`}
+                              position={v.coord}
+                              icon={legPinIcon}
+                            >
+                              <Tooltip direction="top" offset={[0, -20]} opacity={1}>
+                                <div className="text-xs">
+                                  <div className="font-semibold">{stopId}</div>
+                                  <div>{v.name}</div>
+                                </div>
+                              </Tooltip>
+                            </Marker>
+                          ))}
+                        </>
+                      );
+                    })()}
                   </>
                 );
               })()

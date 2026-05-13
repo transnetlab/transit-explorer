@@ -143,6 +143,7 @@ interface UploadedFiles {
   trips?: File;
   stopTimes?: File;
   routeDetails?: File;
+  shapes?: File;
   image?: File;
   vehicles?: File;
   calendar?: File;
@@ -216,6 +217,7 @@ const API_ENDPOINTS = {
   trips: '/api/trips/upload',
   stopTimes: '/api/stop_times/upload',
   routeDetails: '/api/route_details/upload',
+  shapes: '/api/shapes/upload',
   vehicles: '/api/vehicles-data/upload',
   agency: '/api/agency/upload',
   depot: '/api/depot/upload',
@@ -283,6 +285,7 @@ const uploadFileToAPI = async (
       '/api/trips/upload': 'tripsFile',
       '/api/stop_times/upload': 'stopTimesFile',
       '/api/route_details/upload': 'routeDetailsFile',
+      '/api/shapes/upload': 'ShapesFile',
       '/api/vehicles-data/upload': 'vehiclesFile',
       '/api/agency/upload': 'agencyFile',
       '/api/depot/upload': 'depotFile',
@@ -609,6 +612,7 @@ export function CitySelection() {
   const [transfersRefLoading, setTransfersRefLoading] = useState<boolean>(false);
   const [agencyRefLoading, setAgencyRefLoading] = useState<boolean>(false);
   const [depotRefLoading, setDepotRefLoading] = useState<boolean>(false);
+  const [shapesRefLoading, setShapesRefLoading] = useState<boolean>(false);
   // Removed fileInputRef (unused)
   const isGuest = (localStorage.getItem('isGuest') || 'false') === 'true';
   // Download a detailed error report when uploads fail
@@ -866,6 +870,9 @@ export function CitySelection() {
       }
       if (uploadedFiles.routeDetails) {
         uploads.push({ file: uploadedFiles.routeDetails, endpoint: API_ENDPOINTS.routeDetails, name: 'Route Details' });
+      }
+      if (uploadedFiles.shapes) {
+        uploads.push({ file: uploadedFiles.shapes, endpoint: API_ENDPOINTS.shapes, name: 'Shapes' });
       }
       if (uploadedFiles.agency) {
         uploads.push({ file: uploadedFiles.agency, endpoint: API_ENDPOINTS.agency, name: 'Agency' });
@@ -1350,6 +1357,41 @@ export function CitySelection() {
     }
   };
 
+  const handleDownloadShapesRef = async () => {
+    try {
+      setShapesRefLoading(true);
+      const api_key = localStorage.getItem('api_key');
+      const user_id = localStorage.getItem('userId');
+      const file_type = 'txt';
+      const payload: Record<string, any> = { file_type };
+      if (user_id) payload.user_id = String(user_id);
+      if (api_key) payload.api_key = api_key;
+
+      const res = await fetchWithFallback(API_2_BASES, '/api/shapes-data/download', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(text || 'Failed to download shapes reference file');
+      }
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `shapes-reference.${file_type}`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err: any) {
+      setUploadError(err?.message || 'Failed to download shapes reference file');
+    } finally {
+      setShapesRefLoading(false);
+    }
+  };
+
   const requiredFiles = [
     { 
       key: 'routes' as keyof UploadedFiles, 
@@ -1432,11 +1474,11 @@ export function CitySelection() {
       server: API_BASE_URL_FILES
     },
     { 
-      key: 'Shapes' as keyof UploadedFiles, 
+      key: 'shapes' as keyof UploadedFiles, 
       label: 'Shapes Data', 
       required: false, 
       description: 'JSON/TXT file containing detailed route paths and coordinates (optional)',
-      apiEndpoint: API_ENDPOINTS.routeDetails,
+      apiEndpoint: API_ENDPOINTS.shapes,
       server: API_BASE_URL_FILES
     }
   ];
@@ -1861,6 +1903,18 @@ export function CitySelection() {
                                 className="text-xs text-blue-600 dark:text-blue-300 hover:underline disabled:opacity-60"
                               >
                                 {depotRefLoading ? 'Downloading…' : 'Download depot reference file'}
+                              </button>
+                            </div>
+                          )}
+                          {fileConfig.key === 'shapes' && (
+                            <div className="mt-2">
+                              <button
+                                type="button"
+                                onClick={handleDownloadShapesRef}
+                                disabled={shapesRefLoading}
+                                className="text-xs text-blue-600 dark:text-blue-300 hover:underline disabled:opacity-60"
+                              >
+                                {shapesRefLoading ? 'Downloading…' : 'Download shapes reference file'}
                               </button>
                             </div>
                           )}
