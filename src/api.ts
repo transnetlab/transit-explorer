@@ -438,9 +438,11 @@ export const getUserCities = async (payload: { user_id: string | number; api_key
 };
 
 // 8) Run RAPTOR (multi-leg transit + walk routing)
+const RAPTOR_AUTH_BYPASS_CITY_IDS = new Set(['0000000001', '0000000002', '0000000003']);
+
 export const runRaptor = async (payload: {
-  user_id: string;
-  api_key: string;
+  user_id?: string;
+  api_key?: string;
   unique_city_id: string;
   city_name: string;
   origin: { lat: number; lon: number };
@@ -448,11 +450,32 @@ export const runRaptor = async (payload: {
   departure_time: string;
 }): Promise<any> => {
   try {
+    const uniqueCityId = String(payload.unique_city_id || '').trim();
+    const bypassAuth = RAPTOR_AUTH_BYPASS_CITY_IDS.has(uniqueCityId);
+    const userId = String(payload.user_id || '').trim();
+    const apiKey = String(payload.api_key || '').trim();
+
+    if (!bypassAuth && (!userId || !apiKey)) {
+      throw new Error('Missing user_id / api_key for run-raptor');
+    }
+
+    const effectivePayload: Record<string, any> = {
+      ...payload,
+      unique_city_id: uniqueCityId,
+    };
+    if (bypassAuth) {
+      delete effectivePayload.user_id;
+      delete effectivePayload.api_key;
+    } else {
+      effectivePayload.user_id = userId;
+      effectivePayload.api_key = apiKey;
+    }
+
     const bases = getBaseUrlsForPort(3001);
     const response = await axiosPostWithFallback(
       bases,
       '/run-raptor',
-      payload,
+      effectivePayload,
       { headers: { 'Content-Type': 'application/json' } }
     );
     return response.data;

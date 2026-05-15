@@ -342,7 +342,7 @@
 
 // export default RoutePlanning;
 import { useMemo, useState, useEffect, useRef } from 'react';
-import { useNavigate, useParams, useLocation } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import { MapContainer, TileLayer, Marker, Polyline, Popup, Tooltip, useMapEvents, useMap, Circle, CircleMarker } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
@@ -393,6 +393,7 @@ type RouteSegment = {
   path: [number, number][];
   mode: RouteSegmentMode;
   label?: string;
+  color?: string;
   anchor?: [number, number];
   fromStopId?: string;
   toStopId?: string;
@@ -420,6 +421,14 @@ const ROUTE_OPTION_COLORS: Record<RouteOptionKey, string> = {
 };
 
 const LEG_FLAG_ICON_CACHE = new Map<string, any>();
+
+const normalizeHexRouteColor = (raw: any): string | undefined => {
+  const s = String(raw || '').trim();
+  if (!s) return undefined;
+  const clean = s.startsWith('#') ? s.slice(1) : s;
+  if (/^[0-9a-fA-F]{6}$/.test(clean)) return `#${clean}`;
+  return undefined;
+};
 
 const makeLegFlagIcon = (tag: 'TRANSIT' | 'WALK', label: string, color: string) => {
   const cleanLabel = String(label || '').trim() || (tag === 'WALK' ? 'Walk' : 'Transit');
@@ -460,48 +469,8 @@ const makeLegFlagIcon = (tag: 'TRANSIT' | 'WALK', label: string, color: string) 
   return icon;
 };
 
-const isRaptorFixtureEnabled = (): boolean => {
-  // Primarily a dev/testing tool. Allow enabling on localhost even in non-DEV builds
-  // (e.g., Electron packaged app or preview) so it remains testable.
-  const isLocalHost = (() => {
-    try {
-      const h = String(window.location.hostname || '').toLowerCase();
-      return h === 'localhost' || h === '127.0.0.1' || h === '::1';
-    } catch {
-      return false;
-    }
-  })();
-
-  if (!import.meta.env.DEV && !isLocalHost) return false;
-  try {
-    const qs = new URLSearchParams(window.location.search);
-    if (qs.get('raptorFixture') === '1') return true;
-  } catch {
-    // ignore
-  }
-  // HashRouter puts route + query inside the hash, e.g.
-  //   http://localhost:3000/#/austin/route-planning?raptorFixture=1
-  // so we also parse querystring from window.location.hash.
-  try {
-    const hash = String(window.location.hash || '');
-    const qIndex = hash.indexOf('?');
-    if (qIndex >= 0 && qIndex + 1 < hash.length) {
-      const qs = new URLSearchParams(hash.slice(qIndex + 1));
-      if (qs.get('raptorFixture') === '1') return true;
-    }
-  } catch {
-    // ignore
-  }
-  try {
-    return (localStorage.getItem('raptorFixture') || '').trim() === '1';
-  } catch {
-    return false;
-  }
-};
-
 export function RoutePlanning() {
   const navigate = useNavigate();
-  const location = useLocation();
   const { city } = useParams();
   const [source, setSource] = useState<Point>({ lat: null, lon: null });
   const [dest, setDest] = useState<Point>({ lat: null, lon: null });
@@ -551,8 +520,6 @@ export function RoutePlanning() {
   } | null>(null);
   const [calendarRangeLoading, setCalendarRangeLoading] = useState<boolean>(true);
   const didInitCalendarFromRangeRef = useRef<boolean>(false);
-
-  const raptorFixtureEnabled = useMemo(() => isRaptorFixtureEnabled(), [location.search, location.hash]);
 
   const [floatingCardOffset, setFloatingCardOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const floatingDragRef = useRef<{
@@ -1644,6 +1611,8 @@ export function RoutePlanning() {
                   ? 'Walk'
                   : 'Leg';
 
+            const transitColor = segmentMode === 'transit' ? normalizeHexRouteColor(leg?.route_color) : undefined;
+
             // Important: Stop pin coordinates must correspond to the stop itself.
             // If we don't have a real coordinate for the stop (via stop list or path geometry),
             // do NOT infer it from fallback segment geometry.
@@ -1656,6 +1625,7 @@ export function RoutePlanning() {
               path: segPath,
               mode: segmentMode,
               label,
+              color: transitColor,
               anchor: pickAnchor(segPath),
               fromStopId: fromId || undefined,
               toStopId: toId || undefined,
@@ -1692,43 +1662,7 @@ export function RoutePlanning() {
   };
 
   const planRoute = async () => {
-    const fixtureEnabled = isRaptorFixtureEnabled();
-    if (!bothSet && !fixtureEnabled) return;
-
-    if (fixtureEnabled) {
-      setLoading(true);
-      setServerError(null);
-      setRouteOptions({});
-      try {
-        const mod = await import('../fixtures/raptorFixture');
-        const root = (mod as any)?.RAPTOR_FIXTURE_SAMPLE || {};
-        const { mappedPath, info, nextOptions } = parseRaptorRootToOptions(root);
-
-        if (!mappedPath.length) throw new Error('Fixture did not include a usable path geometry');
-
-        setRouteOptions(nextOptions);
-        const availableKeys = (Object.keys(nextOptions) as RouteOptionKey[]).sort((a, b) => Number(a) - Number(b));
-        const firstKey = availableKeys[0];
-        const desiredKey: RouteOptionKey | undefined =
-          routeOptionView === 'all' ? firstKey : (routeOptionView as RouteOptionKey);
-        const keyToUse = (desiredKey && nextOptions[desiredKey] ? desiredKey : firstKey) || '1';
-        setRouteInfo(nextOptions[keyToUse]?.info || info);
-
-        // If user hasn't set points, seed them from the rendered option.
-        if (source.lat === null || source.lon === null || dest.lat === null || dest.lon === null) {
-          const ends = getOptionEnds(nextOptions[keyToUse]);
-          if (ends.start) setSource({ lat: ends.start[0], lon: ends.start[1] });
-          if (ends.end) setDest({ lat: ends.end[0], lon: ends.end[1] });
-        }
-      } catch (err: any) {
-        setServerError(err?.message || 'Failed to load fixture route');
-        setRouteInfo(null);
-        setRouteOptions({});
-      } finally {
-        setLoading(false);
-      }
-      return;
-    }
+    if (!bothSet) return;
 
     // Strict date availability enforcement
     if (!selectedDate) {
@@ -1783,8 +1717,14 @@ export function RoutePlanning() {
       const api_key = (localStorage.getItem('api_key') || '').trim();
       const unique_city_id = (getUniqueCityId() || '').trim();
 
-      if (!user_id || !api_key || !unique_city_id) {
-        throw new Error('Missing user_id / api_key / unique_city_id for route planning');
+      const RAPTOR_AUTH_BYPASS_CITY_IDS = new Set(['0000000001', '0000000002', '0000000003']);
+      const bypassAuth = RAPTOR_AUTH_BYPASS_CITY_IDS.has(unique_city_id);
+
+      if (!unique_city_id) {
+        throw new Error('Missing unique_city_id for route planning');
+      }
+      if (!bypassAuth && (!user_id || !api_key)) {
+        throw new Error('Missing user_id / api_key for route planning');
       }
       if (source.lat === null || source.lon === null || dest.lat === null || dest.lon === null) {
         throw new Error('Missing origin/destination coordinates');
@@ -1795,14 +1735,13 @@ export function RoutePlanning() {
         throw new Error('Missing departure time');
       }
 
-      const payload = {
-        user_id,
-        api_key,
+      const payload: any = {
         unique_city_id,
         city_name: resolvedCityName,
         origin: { lat: source.lat, lon: source.lon },
         destination: { lat: dest.lat, lon: dest.lon },
         departure_time,
+        ...(bypassAuth ? {} : { user_id, api_key }),
       };
 
       const json = await runRaptor(payload);
@@ -2434,24 +2373,20 @@ export function RoutePlanning() {
                 )}
               </div>
 
-              {(bothSet || raptorFixtureEnabled) && (
+              {bothSet && (
                 <div className="mt-3 p-3 rounded-md bg-green-50 dark:bg-green-900/30 text-green-700 dark:text-green-300 text-sm">
                   <div className="font-medium mb-1 flex items-center">
-                    <Navigation size={16} className="mr-2" /> {raptorFixtureEnabled && !bothSet ? 'Fixture ready' : 'Points ready'}
+                    <Navigation size={16} className="mr-2" /> Points ready
                   </div>
-                  {bothSet ? (
-                    <>
-                      <div>Source: {source.lat?.toFixed(6)}, {source.lon?.toFixed(6)}</div>
-                      <div>Destination: {dest.lat?.toFixed(6)}, {dest.lon?.toFixed(6)}</div>
-                    </>
-                  ) : (
-                    <div className="text-xs opacity-90">Loads the hardcoded RAPTOR result (dev-only).</div>
-                  )}
+                  <>
+                    <div>Source: {source.lat?.toFixed(6)}, {source.lon?.toFixed(6)}</div>
+                    <div>Destination: {dest.lat?.toFixed(6)}, {dest.lon?.toFixed(6)}</div>
+                  </>
                     <button
                       type="button"
                       onClick={planRoute}
                       className="mt-3 inline-flex items-center px-4 py-2 rounded-lg text-sm font-medium text-white bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
-                      disabled={raptorFixtureEnabled ? loading : (loading || !selectedDate || !serviceAvailability[`${selectedDate.getFullYear()}${String(selectedDate.getMonth()+1).padStart(2,'0')}${String(selectedDate.getDate()).padStart(2,'0')}`])}
+                      disabled={loading || !selectedDate || !serviceAvailability[`${selectedDate.getFullYear()}${String(selectedDate.getMonth()+1).padStart(2,'0')}${String(selectedDate.getDate()).padStart(2,'0')}`]}
                     >
                       {loading ? (
                         <span className="flex items-center"><span className="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2"></span>Planning…</span>
@@ -2779,14 +2714,14 @@ export function RoutePlanning() {
                   return [
                     ...segs.flatMap((s, idx) => {
                     const baseKey = `route-option-${k}-seg-${idx}`;
-                    const pinColor = s.mode === 'walk' ? 'orange' : color;
+                    const segColor = s.mode === 'walk' ? 'orange' : (s.color || color);
                     const parts = splitPathOnLargeJumps(s.path);
                     const items: any[] = parts.map((p, partIdx) => (
                       <Polyline
                         key={`${baseKey}-part-${partIdx}`}
                         positions={p}
                         pathOptions={{
-                          color: s.mode === 'walk' ? 'orange' : color,
+                          color: segColor,
                           weight: 4,
                           opacity: 0.85,
                           ...(s.mode === 'walk' ? { dashArray: '2 10', lineCap: 'round' } : {}),
@@ -2799,7 +2734,7 @@ export function RoutePlanning() {
                         <Marker
                           key={`${baseKey}-flag`}
                           position={s.anchor}
-                          icon={makeLegFlagIcon('TRANSIT', s.label || 'Transit', color)}
+                          icon={makeLegFlagIcon('TRANSIT', s.label || 'Transit', segColor)}
                         >
                           <Popup>
                             <div className="text-xs">
@@ -2924,14 +2859,14 @@ export function RoutePlanning() {
                         <>
                           {segs.flatMap((s, idx) => {
                       const baseKey = `route-option-${k}-seg-${idx}`;
-                      const pinColor = s.mode === 'walk' ? 'orange' : color;
+                      const segColor = s.mode === 'walk' ? 'orange' : (s.color || color);
                       const parts = splitPathOnLargeJumps(s.path);
                       const items: any[] = parts.map((p, partIdx) => (
                         <Polyline
                           key={`${baseKey}-part-${partIdx}`}
                           positions={p}
                           pathOptions={{
-                            color: s.mode === 'walk' ? 'orange' : color,
+                            color: segColor,
                             weight: 4,
                             opacity: 0.85,
                             ...(s.mode === 'walk' ? { dashArray: '2 10', lineCap: 'round' } : {}),
@@ -2944,7 +2879,7 @@ export function RoutePlanning() {
                           <Marker
                             key={`${baseKey}-flag`}
                             position={s.anchor}
-                            icon={makeLegFlagIcon('TRANSIT', s.label || 'Transit', color)}
+                            icon={makeLegFlagIcon('TRANSIT', s.label || 'Transit', segColor)}
                           >
                             <Popup>
                               <div className="text-xs">
