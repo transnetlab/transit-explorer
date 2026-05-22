@@ -7,7 +7,13 @@ export function HomePage() {
   const { city } = useParams();
   const [infoOpen, setInfoOpen] = useState<null | { title: string; description: string }>(null);
 
-  const isDefaultCity = city === 'bangalore' || city === 'paris' || city === 'austin' || city === 'dharwad';
+  const isDefaultCity =
+    city === 'bangalore' ||
+    city === 'paris' ||
+    city === 'austin' ||
+    city === 'sydney' ||
+    city === 'colombia' ||
+    city === 'dharwad';
 
   const selectedUniqueCityId = String(
     localStorage.getItem('selectedCityUniqueId') ||

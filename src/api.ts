@@ -16,6 +16,8 @@ export const getRoutes = async (): Promise<Route[]> => {
       selectedCityId === 'bangalore' ||
       selectedCityId === 'paris' ||
       selectedCityId === 'austin' ||
+      selectedCityId === 'sydney' ||
+      selectedCityId === 'colombia' ||
       selectedCityId === 'dharwad';
     const isCustomCity = selectedCityIsCustomRaw === '1' || (!selectedCityIsCustomRaw && !!selectedCityId && !isKnownDefaultCity);
 
@@ -438,7 +440,12 @@ export const getUserCities = async (payload: { user_id: string | number; api_key
 };
 
 // 8) Run RAPTOR (multi-leg transit + walk routing)
-const RAPTOR_AUTH_BYPASS_CITY_IDS = new Set(['0000000001', '0000000002', '0000000003']);
+const normalizeGuestCityUniqueId = (raw: string): { uniqueCityId: string; bypassAuth: boolean } => {
+  const trimmed = String(raw || '').trim();
+  const m = trimmed.match(/^0*([12345])$/);
+  if (!m) return { uniqueCityId: trimmed, bypassAuth: false };
+  return { uniqueCityId: String(m[1]).padStart(10, '0'), bypassAuth: true };
+};
 
 export const runRaptor = async (payload: {
   user_id?: string;
@@ -448,10 +455,10 @@ export const runRaptor = async (payload: {
   origin: { lat: number; lon: number };
   destination: { lat: number; lon: number };
   departure_time: string;
+  disallowed_route_types?: string[];
 }): Promise<any> => {
   try {
-    const uniqueCityId = String(payload.unique_city_id || '').trim();
-    const bypassAuth = RAPTOR_AUTH_BYPASS_CITY_IDS.has(uniqueCityId);
+    const { uniqueCityId, bypassAuth } = normalizeGuestCityUniqueId(payload.unique_city_id);
     const userId = String(payload.user_id || '').trim();
     const apiKey = String(payload.api_key || '').trim();
 
@@ -471,7 +478,19 @@ export const runRaptor = async (payload: {
       effectivePayload.api_key = apiKey;
     }
 
-    const bases = getBaseUrlsForPort(3001);
+    let bases = getBaseUrlsForPort(3001);
+    // In guest/bypass mode, the local backend may respond with a 4xx "missing_api_key/user_id".
+    // Our fallback logic does not retry on 4xx, so prefer official first in this specific case.
+    if (bypassAuth) {
+      const localBase = String(getLocalBaseUrlForPort(3001) || '').trim();
+      if (localBase) {
+        bases = [...bases].sort((a, b) => {
+          const aIsLocal = String(a || '').trim() === localBase;
+          const bIsLocal = String(b || '').trim() === localBase;
+          return Number(aIsLocal) - Number(bIsLocal);
+        });
+      }
+    }
     const response = await axiosPostWithFallback(
       bases,
       '/run-raptor',
@@ -492,7 +511,13 @@ export const runRaptor = async (payload: {
 // 9) Default-city calendar range (no auth; default datasets only)
 export const getDefaultCityCalendarRange = async (cityId: string, signal?: AbortSignal): Promise<any> => {
   const id = String(cityId || '').trim().toLowerCase();
-  const port = id === 'bangalore' ? 3000 : id === 'paris' ? 3001 : id === 'austin' ? 3002 : undefined;
+  const port =
+    id === 'bangalore' ? 3000 :
+    id === 'paris' ? 3001 :
+    id === 'austin' ? 3002 :
+    id === 'sydney' ? 3003 :
+    id === 'colombia' ? 3004 :
+    undefined;
   if (!port) {
     throw new Error(`Unsupported default city for calendar range: ${cityId}`);
   }
@@ -524,7 +549,13 @@ export const getDefaultCityCalendarCheckService = async (
     throw new Error(`Invalid date for default city check service: ${date}`);
   }
 
-  const port = id === 'bangalore' ? 3000 : id === 'paris' ? 3001 : id === 'austin' ? 3002 : undefined;
+  const port =
+    id === 'bangalore' ? 3000 :
+    id === 'paris' ? 3001 :
+    id === 'austin' ? 3002 :
+    id === 'sydney' ? 3003 :
+    id === 'colombia' ? 3004 :
+    undefined;
   if (!port) {
     throw new Error(`Unsupported default city for check service: ${cityId}`);
   }

@@ -203,6 +203,28 @@ export const defaultCities: City[] = [
   centerLat: 30.2672,
   centerLon: -97.7431,
   unique_city_id: '0000000003'
+},
+{
+  id: 'sydney',
+  name: 'Sydney, New South Wales, Australia',
+  description: 'Navigate through Sydney\'s public transportation network',
+  imageUrl: 'https://upload.wikimedia.org/wikipedia/commons/thumb/5/53/Sydney_Opera_House_and_Harbour_Bridge_Dusk_%282%29_2019-06-21.jpg/1920px-Sydney_Opera_House_and_Harbour_Bridge_Dusk_%282%29_2019-06-21.jpg',
+  enabled: true,
+  port: 3003,
+  centerLat: -33.8688,
+  centerLon: 151.2093,
+  unique_city_id: '0000000004'
+},
+{
+  id: 'colombia',
+  name: 'Bogotá, Colombia',
+  description: 'Navigate through Colombia\'s public transportation network',
+  imageUrl: 'https://upload.wikimedia.org/wikipedia/commons/thumb/1/15/Vista_Hacia_La_Torre_Bacat%C3%A1_%28242256171%29.jpeg/1280px-Vista_Hacia_La_Torre_Bacat%C3%A1_%28242256171%29.jpeg',
+  enabled: true,
+  port: 3004,
+  centerLat: 4.7110,
+  centerLon: -74.0721,
+  unique_city_id: '0000000005'
 }
 ];
 

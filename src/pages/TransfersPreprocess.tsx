@@ -7,7 +7,13 @@ export function TransfersPreprocess() {
   const navigate = useNavigate();
   const { city } = useParams();
 
-  const isDefaultCity = city === 'bangalore' || city === 'paris' || city === 'austin' || city === 'dharwad';
+  const isDefaultCity =
+    city === 'bangalore' ||
+    city === 'paris' ||
+    city === 'austin' ||
+    city === 'sydney' ||
+    city === 'colombia' ||
+    city === 'dharwad';
   const DEFAULT_PREPROCESS_PAYLOAD = useMemo(
     () => ({ user_id: '123456', api_key: '123456', unique_city_id: '123456' }),
     []
@@ -139,7 +145,7 @@ export function TransfersPreprocess() {
             <div>
               <h2 className="text-base font-semibold">Preprocess transfers</h2>
               <p className="text-xs text-gray-600 dark:text-gray-300 mt-1">
-                For default cities (Bangalore/Paris/Austin), this uses built-in credentials. Otherwise requires user_id, api_key, and
+                For default cities (Bangalore/Paris/Austin/Sydney/Colombia), this uses built-in credentials. Otherwise requires user_id, api_key, and
                 unique_city_id in localStorage.
               </p>
             </div>

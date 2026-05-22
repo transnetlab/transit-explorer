@@ -688,8 +688,8 @@ export function Map3D({ path, selectedRouteId, selectedStop, showStopOnly = fals
       <div ref={containerRef} className="w-full h-full" />
 
       {routeInfo && (
-        <div className="absolute bottom-4 left-4 bg-white rounded-lg shadow-lg p-8 z-[1000] max-w-xs border border-black">
-          <div className="flex items-center space-x-4">
+        <div className="absolute bottom-4 left-4 bg-white rounded-lg shadow-lg p-4 sm:p-8 z-[1000] max-w-[calc(100vw-2rem)] sm:max-w-xs border border-black">
+          <div className="flex flex-wrap items-center gap-3 sm:gap-4">
             <div className="flex items-center text-gray-700">
               <Clock size={16} className="mr-1" />
               <span className="text-sm font-medium">{routeInfo.estimated_duration}</span>

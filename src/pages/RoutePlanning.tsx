@@ -346,7 +346,7 @@ import { useNavigate, useParams } from 'react-router-dom';
 import { MapContainer, TileLayer, Marker, Polyline, Popup, Tooltip, useMapEvents, useMap, Circle, CircleMarker } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
-import { ArrowLeft, MapPin, Navigation, RefreshCcw, Shuffle, Menu, X, Clock, Route as RouteIcon } from 'lucide-react';
+import { ArrowLeft, MapPin, Navigation, RefreshCcw, Shuffle, Menu, X, Clock, Route as RouteIcon, ChevronDown, ChevronUp } from 'lucide-react';
 import { defaultCities } from './CitySelection';
 import { getDefaultCityCalendarCheckService, getDefaultCityCalendarRange, getStops, getUserCities, runRaptor } from '../api';
 import { Stop } from '../types';
@@ -394,7 +394,9 @@ type RouteSegment = {
   mode: RouteSegmentMode;
   label?: string;
   color?: string;
+  routeType?: number;
   anchor?: [number, number];
+  intermediateStops?: { coord: [number, number]; name: string }[];
   fromStopId?: string;
   toStopId?: string;
   fromCoord?: [number, number];
@@ -403,6 +405,11 @@ type RouteSegment = {
   toName?: string;
   estimatedDuration?: string;
   estimatedDistance?: string;
+  // RAPTOR timing semantics (when available)
+  fromArrivalTime?: string;
+  fromDepartureTime?: string;
+  toArrivalTime?: string;
+  waitingTime?: string;
   departTime?: string;
   arriveTime?: string;
 };
@@ -430,9 +437,50 @@ const normalizeHexRouteColor = (raw: any): string | undefined => {
   return undefined;
 };
 
-const makeLegFlagIcon = (tag: 'TRANSIT' | 'WALK', label: string, color: string) => {
-  const cleanLabel = String(label || '').trim() || (tag === 'WALK' ? 'Walk' : 'Transit');
-  const cacheKey = tag === 'WALK' ? `${tag}||${color}` : `${tag}||${color}||${cleanLabel}`;
+const routeTypeToModeName = (routeType: any): string => {
+  const n = Number(routeType);
+  switch (n) {
+    case 0:
+      return 'Tram';
+    case 1:
+      return 'Metro';
+    case 2:
+      return 'Rail';
+    case 3:
+      return 'Bus';
+    case 4:
+      return 'Ferry';
+    case 5:
+      return 'Cable Tram';
+    case 6:
+      return 'Aerial Lift';
+    case 7:
+      return 'Funicular';
+    case 11:
+      return 'Trolleybus';
+    case 12:
+      return 'Monorail';
+    default:
+      return 'Transit';
+  }
+};
+
+const routeTypeToTag = (routeType: any): string => routeTypeToModeName(routeType).toUpperCase();
+
+const titleCaseWords = (s: string): string =>
+  String(s || '')
+    .trim()
+    .split(/\s+/g)
+    .filter(Boolean)
+    .map((w) => w.slice(0, 1).toUpperCase() + w.slice(1).toLowerCase())
+    .join(' ');
+
+const makeLegFlagIcon = (tag: string, label: string, color: string) => {
+  const tagText = String(tag || '').trim() || 'TRANSIT';
+  const isWalk = tagText.toUpperCase() === 'WALK';
+  const defaultLabel = isWalk ? 'Walk' : titleCaseWords(tagText);
+  const cleanLabel = String(label || '').trim() || defaultLabel;
+  const cacheKey = isWalk ? `${tagText}||${color}` : `${tagText}||${color}||${cleanLabel}`;
   const cached = LEG_FLAG_ICON_CACHE.get(cacheKey);
   if (cached) return cached;
 
@@ -453,8 +501,8 @@ const makeLegFlagIcon = (tag: 'TRANSIT' | 'WALK', label: string, color: string) 
       box-shadow:0 1px 2px rgba(0,0,0,0.15);
       white-space:nowrap;
     ">
-      <span style="font-size:10px; font-weight:700;">${tag}</span>
-      ${tag === 'WALK' ? '' : `<span>${safe.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</span>`}
+      <span style="font-size:10px; font-weight:700;">${tagText}</span>
+      ${isWalk ? '' : `<span>${safe.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</span>`}
     </div>
   `.trim();
 
@@ -475,10 +523,12 @@ export function RoutePlanning() {
   const [source, setSource] = useState<Point>({ lat: null, lon: null });
   const [dest, setDest] = useState<Point>({ lat: null, lon: null });
   const [pickMode, setPickMode] = useState<'source' | 'dest' | null>(null);
+  const [mapContextMenu, setMapContextMenu] = useState<{ lat: number; lon: number } | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [routeInfo, setRouteInfo] = useState<{ estimated_duration: string; total_distance: string } | null>(null);
   const [routeOptions, setRouteOptions] = useState<Partial<Record<RouteOptionKey, RouteOption>>>({});
   const [routeOptionView, setRouteOptionView] = useState<RouteOptionView>('1');
+  const [expandedLeg, setExpandedLeg] = useState<{ optionKey: RouteOptionKey; idx: number } | null>(null);
   const [loading, setLoading] = useState(false);
   const [serverError, setServerError] = useState<string | null>(null);
   // Use centralized API base
@@ -488,8 +538,18 @@ export function RoutePlanning() {
   const [sourceName, setSourceName] = useState<string>('');
   const [destName, setDestName] = useState<string>('');
   const [disallowedModes, setDisallowedModes] = useState<string[]>([]); // ['bus','metro','ferry','walk']
+  const [availableRouteTypes, setAvailableRouteTypes] = useState<
+    { mode: string; label: string; route_type_values: number[]; route_count: number }[]
+  >([]);
+  const [routeTypesLoading, setRouteTypesLoading] = useState<boolean>(false);
+  const [routeTypesError, setRouteTypesError] = useState<string | null>(null);
   const [walkingTimeLimitMin, setWalkingTimeLimitMin] = useState<number>(10);
   const [waitingTimeLimitMin, setWaitingTimeLimitMin] = useState<number>(15);
+  // NOTE: Limits intentionally disabled (UI + payload). Keep state around for easy re-enable.
+  void walkingTimeLimitMin;
+  void waitingTimeLimitMin;
+  void setWalkingTimeLimitMin;
+  void setWaitingTimeLimitMin;
   // Stop name autocomplete state
   const [sourceSuggestionsVisible, setSourceSuggestionsVisible] = useState<boolean>(false);
   const [destSuggestionsVisible, setDestSuggestionsVisible] = useState<boolean>(false);
@@ -507,7 +567,12 @@ export function RoutePlanning() {
   const [serviceAvailability, setServiceAvailability] = useState<Record<string, boolean>>({}); // key YYYYMMDD -> available
   const [availabilityCache, setAvailabilityCache] = useState<Record<string, Record<string, boolean>>>({}); // key YYYY-MM -> map
   const [selectedDate, setSelectedDate] = useState<Date | null>(null);
-  const [timePart, setTimePart] = useState<string>('');
+  const [timePart, setTimePart] = useState<string>(() => {
+    const d = new Date();
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    return `${hh}:${mm}`;
+  });
   const monthKey = useMemo(() => `${calendarMonth.getFullYear()}-${String(calendarMonth.getMonth()+1).padStart(2,'0')}`, [calendarMonth]);
   const [monthLoading, setMonthLoading] = useState<boolean>(false);
   const fallbackMaxYear = new Date().getFullYear();
@@ -520,6 +585,73 @@ export function RoutePlanning() {
   } | null>(null);
   const [calendarRangeLoading, setCalendarRangeLoading] = useState<boolean>(true);
   const didInitCalendarFromRangeRef = useRef<boolean>(false);
+
+  const fetchCityRouteTypes = async () => {
+    setRouteTypesError(null);
+    setRouteTypesLoading(true);
+    try {
+      const selectedCityIsCustomRaw = (localStorage.getItem('selectedCityIsCustom') || '').trim();
+      const selectedCityId = (localStorage.getItem('selectedCityId') || '').trim().toLowerCase();
+      const isKnownDefaultCity =
+        selectedCityId === 'bangalore' ||
+        selectedCityId === 'paris' ||
+        selectedCityId === 'austin' ||
+        selectedCityId === 'sydney' ||
+        selectedCityId === 'colombia' ||
+        selectedCityId === 'dharwad';
+      const isCustomCity = selectedCityIsCustomRaw === '1' || (!selectedCityIsCustomRaw && !!selectedCityId && !isKnownDefaultCity);
+
+      const unique_city_id = (
+        localStorage.getItem('selectedCityUniqueId') ||
+        localStorage.getItem('unique_city_id') ||
+        localStorage.getItem('uniqueCityId') ||
+        ''
+      ).trim();
+      if (!unique_city_id) throw new Error('Missing unique_city_id for this city');
+
+      const params = new URLSearchParams();
+      params.set('unique_city_id', unique_city_id);
+      if (isCustomCity) {
+        const user_id = (localStorage.getItem('userId') || '').trim();
+        const api_key = (localStorage.getItem('api_key') || '').trim();
+        if (!user_id || !api_key) throw new Error('Missing user credentials (user_id/api_key)');
+        params.set('user_id', user_id);
+        params.set('api_key', api_key);
+      }
+
+      const res = await fetchWithFallback(API_2_BASES, `/api/disallowed-route-types?${params.toString()}`);
+      const json = await res.json().catch(() => null);
+      if (!res.ok) {
+        const msg = String(json?.message || json?.error || res.statusText || 'Failed to fetch route types');
+        throw new Error(msg);
+      }
+
+      const listRaw = Array.isArray(json?.available_route_types) ? json.available_route_types : [];
+      const normalized = listRaw
+        .map((r: any) => {
+          const mode = String(r?.mode || '').trim();
+          if (!mode) return null;
+          const label = String(r?.label || mode).trim();
+          const route_type_values = Array.isArray(r?.route_type_values)
+            ? r.route_type_values.map((x: any) => Number(x)).filter((n: any) => Number.isFinite(n))
+            : [];
+          const route_count = Number.isFinite(Number(r?.route_count)) ? Number(r.route_count) : 0;
+          return { mode, label, route_type_values, route_count };
+        })
+        .filter(Boolean) as { mode: string; label: string; route_type_values: number[]; route_count: number }[];
+
+      setAvailableRouteTypes(normalized);
+      setDisallowedModes((prev) => {
+        const allowed = new Set(normalized.map((x) => x.mode));
+        return prev.filter((m) => allowed.has(m));
+      });
+    } catch (e: any) {
+      setRouteTypesError(String(e?.message || e || 'Failed to fetch route types'));
+      setAvailableRouteTypes([]);
+    } finally {
+      setRouteTypesLoading(false);
+    }
+  };
 
   const [floatingCardOffset, setFloatingCardOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const floatingDragRef = useRef<{
@@ -587,7 +719,7 @@ export function RoutePlanning() {
   useEffect(() => {
     didInitCalendarFromRangeRef.current = false;
     const selectedCityIdLc = (getSelectedCityId() || '').toLowerCase();
-    const isDefaultCityRange = ['bangalore', 'paris', 'austin'].includes(selectedCityIdLc);
+    const isDefaultCityRange = ['bangalore', 'paris', 'austin', 'sydney', 'colombia'].includes(selectedCityIdLc);
 
     const user_id = (localStorage.getItem('userId') || '').trim();
     const api_key = (localStorage.getItem('api_key') || '').trim();
@@ -727,7 +859,7 @@ export function RoutePlanning() {
     const userId = getUserId();
     const uniqueCityId = getUniqueCityId();
     const selectedCityId = (getSelectedCityId() || '').toLowerCase();
-    const isDefaultCity = ['bangalore', 'paris', 'austin'].includes(selectedCityId);
+    const isDefaultCity = ['bangalore', 'paris', 'austin', 'sydney', 'colombia'].includes(selectedCityId);
 
     // Default cities: use the dedicated GET check-service endpoint (no auth).
     if (isDefaultCity) {
@@ -841,6 +973,8 @@ export function RoutePlanning() {
       selectedCityIdLc === 'bangalore' ||
       selectedCityIdLc === 'paris' ||
       selectedCityIdLc === 'austin' ||
+      selectedCityIdLc === 'sydney' ||
+      selectedCityIdLc === 'colombia' ||
       selectedCityIdLc === 'dharwad';
     if (isDefaultCity) return;
 
@@ -892,7 +1026,7 @@ export function RoutePlanning() {
     if (stored) return stored;
 
     const selectedCityIdLc = (getSelectedCityId() || '').toLowerCase();
-    const isDefaultCity = ['bangalore', 'paris', 'austin', 'dharwad'].includes(selectedCityIdLc);
+    const isDefaultCity = ['bangalore', 'paris', 'austin', 'sydney', 'colombia', 'dharwad'].includes(selectedCityIdLc);
     if (isDefaultCity) {
       const defaultObj = defaultCities.find((c: any) => (c.id || '').toLowerCase() === selectedCityIdLc);
       if (defaultObj?.name) return String(defaultObj.name);
@@ -1092,9 +1226,21 @@ export function RoutePlanning() {
     setServerError(null);
   };
 
+  const applyMapPoint = (mode: 'source' | 'dest', lat: number, lon: number) => {
+    const point = { lat: clampLat(lat), lon: clampLon(lon) };
+    if (mode === 'source') setSource(point);
+    if (mode === 'dest') setDest(point);
+    setPickMode(null);
+    setMapContextMenu(null);
+    setRouteInfo(null);
+    setRouteOptions({});
+    setServerError(null);
+  };
+
   function ClickCatcher() {
     useMapEvents({
       click(e) {
+        if (mapContextMenu) setMapContextMenu(null);
         if (!pickMode) return;
         const { lat, lng } = e.latlng;
         const point = { lat: clampLat(lat), lon: clampLon(lng) };
@@ -1105,6 +1251,16 @@ export function RoutePlanning() {
         setRouteInfo(null);
         setRouteOptions({});
         setServerError(null);
+      },
+      contextmenu(e) {
+        // Right-click: show a simple menu to set source/destination.
+        try {
+          (e as any)?.originalEvent?.preventDefault?.();
+          (e as any)?.originalEvent?.stopPropagation?.();
+        } catch {
+          // ignore
+        }
+        setMapContextMenu({ lat: clampLat(e.latlng.lat), lon: clampLon(e.latlng.lng) });
       }
     });
     return null;
@@ -1163,8 +1319,6 @@ export function RoutePlanning() {
       setRouteOptionView(routeOptionKeys[0]);
     }
   }, [routeOptionKeys, routeOptions, routeOptionView]);
-
-  const straightPath = bothSet ? ([[source.lat!, source.lon!], [dest.lat!, dest.lon!]] as [number, number][]) : [];
 
   const fitBoundsInfo = useMemo(() => {
     // Only auto-fit after a route is displayed (i.e., we have options).
@@ -1227,13 +1381,6 @@ export function RoutePlanning() {
     if (!start || !end) return {};
     if (!Number.isFinite(start[0]) || !Number.isFinite(start[1]) || !Number.isFinite(end[0]) || !Number.isFinite(end[1])) return {};
     return { start, end };
-  };
-
-  const midpoint = (a: [number, number], b: [number, number]): [number, number] | undefined => {
-    const lat = (Number(a[0]) + Number(b[0])) / 2;
-    const lon = (Number(a[1]) + Number(b[1])) / 2;
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return undefined;
-    return [lat, lon];
   };
 
   const walkConnectorStyle = { color: 'orange', weight: 3, opacity: 0.9, dashArray: '2 10', lineCap: 'round' as const };
@@ -1547,8 +1694,13 @@ export function RoutePlanning() {
           const fromName = prettyEndpointName(fromId, fromNameFallback);
           const toName = prettyEndpointName(toId, toNameFallback);
 
-          const departTimeRaw = String(leg?.from_arrival_time || '').trim();
-          const arriveTimeRaw = String(leg?.to_arrival_time || '').trim();
+          const fromArrivalTimeRaw = String(leg?.from_arrival_time || '').trim();
+          const fromDepartureTimeRaw = String(leg?.from_departure_time || '').trim();
+          const toArrivalTimeRaw = String(leg?.to_arrival_time || '').trim();
+          const waitingTimeRaw = String(leg?.waiting_time || '').trim();
+
+          const departTimeRaw = fromDepartureTimeRaw || fromArrivalTimeRaw;
+          const arriveTimeRaw = toArrivalTimeRaw;
 
           const legSec =
             parseDurationSeconds(leg?.estimated_duration) ??
@@ -1604,9 +1756,15 @@ export function RoutePlanning() {
 
           if (segPath.length >= 2) {
             pushSegment(pathAcc, segPath);
+            const transitRouteTypeRaw = segmentMode === 'transit' ? leg?.route_type : undefined;
+            const transitRouteType = (() => {
+              const n = Number(transitRouteTypeRaw);
+              return Number.isFinite(n) ? n : undefined;
+            })();
+
             const label =
               segmentMode === 'transit'
-                ? String(leg?.route_name || leg?.route || 'Transit')
+                ? String(leg?.route_name || leg?.route || leg?.trip_headsign || routeTypeToModeName(transitRouteTypeRaw))
                 : segmentMode === 'walk'
                   ? 'Walk'
                   : 'Leg';
@@ -1621,12 +1779,36 @@ export function RoutePlanning() {
 
             const durationText = String(leg?.estimated_duration || '').trim() || (derivedLegSec !== undefined ? formatDuration(derivedLegSec) : '');
             const distanceText = String(leg?.estimated_distance || '').trim() || (legMeters !== undefined ? formatDistance(legMeters) : '');
+
+            const intermediateStops: { coord: [number, number]; name: string }[] | undefined = (() => {
+              if (segmentMode !== 'transit') return undefined;
+              const coordsRaw = (leg as any)?.intermediate_stops_coords;
+              const namesRaw = (leg as any)?.intermediate_stops_names;
+              const idsRaw = (leg as any)?.intermediate_stops;
+              const coords = Array.isArray(coordsRaw) ? coordsRaw : [];
+              const names = Array.isArray(namesRaw) ? namesRaw : [];
+              const ids = Array.isArray(idsRaw) ? idsRaw : [];
+
+              const out: { coord: [number, number]; name: string }[] = [];
+              for (let i = 0; i < coords.length; i++) {
+                const c = coords[i];
+                const lat = Array.isArray(c) ? Number(c[0]) : NaN;
+                const lon = Array.isArray(c) ? Number(c[1]) : NaN;
+                if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+                const nm = String(names[i] ?? ids[i] ?? '').trim() || `Stop ${i + 1}`;
+                out.push({ coord: [clampLat(lat), clampLon(lon)], name: nm });
+              }
+              return out.length ? out : undefined;
+            })();
+
             segments.push({
               path: segPath,
               mode: segmentMode,
               label,
               color: transitColor,
+              routeType: segmentMode === 'transit' ? transitRouteType : undefined,
               anchor: pickAnchor(segPath),
+              intermediateStops,
               fromStopId: fromId || undefined,
               toStopId: toId || undefined,
               fromCoord,
@@ -1635,6 +1817,10 @@ export function RoutePlanning() {
               toName: toName || undefined,
               estimatedDuration: durationText || undefined,
               estimatedDistance: distanceText || undefined,
+              fromArrivalTime: fromArrivalTimeRaw || undefined,
+              fromDepartureTime: fromDepartureTimeRaw || undefined,
+              toArrivalTime: toArrivalTimeRaw || undefined,
+              waitingTime: waitingTimeRaw || undefined,
               departTime: departTimeRaw || undefined,
               arriveTime: arriveTimeRaw || undefined,
             });
@@ -1679,7 +1865,7 @@ export function RoutePlanning() {
     }
     // Final server recheck for robustness
     const selectedCityIdLc = (getSelectedCityId() || '').toLowerCase();
-    const isDefaultCity = ['bangalore', 'paris', 'austin'].includes(selectedCityIdLc);
+    const isDefaultCity = ['bangalore', 'paris', 'austin', 'sydney', 'colombia'].includes(selectedCityIdLc);
     try {
       if (isDefaultCity) {
         const verifyJson = await getDefaultCityCalendarCheckService(selectedCityIdLc, dateKey);
@@ -1715,10 +1901,10 @@ export function RoutePlanning() {
       const resolvedCityName = await resolveCityNameForRouteInfo();
       const user_id = (localStorage.getItem('userId') || '').trim();
       const api_key = (localStorage.getItem('api_key') || '').trim();
-      const unique_city_id = (getUniqueCityId() || '').trim();
-
-      const RAPTOR_AUTH_BYPASS_CITY_IDS = new Set(['0000000001', '0000000002', '0000000003']);
-      const bypassAuth = RAPTOR_AUTH_BYPASS_CITY_IDS.has(unique_city_id);
+      const raw_unique_city_id = (getUniqueCityId() || '').trim();
+      const guestMatch = raw_unique_city_id.match(/^0*([12345])$/);
+      const bypassAuth = !!guestMatch;
+      const unique_city_id = guestMatch ? String(guestMatch[1]).padStart(10, '0') : raw_unique_city_id;
 
       if (!unique_city_id) {
         throw new Error('Missing unique_city_id for route planning');
@@ -1741,6 +1927,7 @@ export function RoutePlanning() {
         origin: { lat: source.lat, lon: source.lon },
         destination: { lat: dest.lat, lon: dest.lon },
         departure_time,
+        ...(disallowedModes.length ? { disallowed_route_types: disallowedModes } : {}),
         ...(bypassAuth ? {} : { user_id, api_key }),
       };
 
@@ -1836,6 +2023,64 @@ export function RoutePlanning() {
     return new Date(t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true });
   };
 
+  const parseColonDurationSeconds = (raw: any): number | undefined => {
+    const s = String(raw ?? '').trim();
+    if (!s) return undefined;
+    const parts = s.split(':');
+    if (parts.length < 2 || parts.length > 3) return undefined;
+
+    const [a, b, c] = parts;
+    const h = parts.length === 3 ? Number(a) : 0;
+    const m = parts.length === 3 ? Number(b) : Number(a);
+    const secRaw = parts.length === 3 ? c : b;
+    const sec = Number.parseFloat(String(secRaw).trim());
+
+    if (![h, m, sec].every(Number.isFinite)) return undefined;
+    const total = h * 3600 + m * 60 + sec;
+    return total > 0 ? total : 0;
+  };
+
+  const parseHumanDurationSeconds = (raw: any): number | undefined => {
+    if (raw === null || raw === undefined) return undefined;
+    if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+    const s = String(raw).trim().toLowerCase();
+    if (!s) return undefined;
+
+    let hours = 0;
+    let minutes = 0;
+    let seconds = 0;
+    const h = s.match(/([0-9]+)\s*(?:h|hr|hrs|hour|hours)/);
+    const m = s.match(/([0-9]+)\s*(?:m|min|mins|minute|minutes)/);
+    const sec = s.match(/([0-9]+)\s*(?:s|sec|secs|second|seconds)/);
+    if (h) hours = Number(h[1]) || 0;
+    if (m) minutes = Number(m[1]) || 0;
+    if (sec) seconds = Number(sec[1]) || 0;
+
+    const total = hours * 3600 + minutes * 60 + seconds;
+    return total > 0 ? total : undefined;
+  };
+
+  const formatWaitTime = (raw: any): string => {
+    const seconds = parseColonDurationSeconds(raw);
+    if (seconds === undefined) return '';
+    if (seconds <= 0) return '';
+    if (seconds < 60) return `${Math.max(1, Math.round(seconds))} sec`;
+    const s = Math.max(0, Math.round(seconds));
+    const hrs = Math.floor(s / 3600);
+    const mins = Math.floor((s % 3600) / 60);
+    if (hrs > 0) return `${hrs} hr ${mins} min`;
+    return `${Math.max(1, mins)} min`;
+  };
+
+  const formatDurationBrief = (seconds: number): string => {
+    const s = Math.max(0, Math.round(seconds));
+    if (s <= 0) return '';
+    const hrs = Math.floor(s / 3600);
+    const mins = Math.floor((s % 3600) / 60);
+    if (hrs > 0) return `${hrs} hr ${mins} min`;
+    return `${Math.max(1, mins)} min`;
+  };
+
   const diffSecondsFromApiTimes = (fromRaw: any, toRaw: any): number | undefined => {
     const a = String(fromRaw || '').trim();
     const b = String(toRaw || '').trim();
@@ -1856,67 +2101,222 @@ export function RoutePlanning() {
     return routeOptionKeys[0];
   }, [routeOptionKeys, routeOptionView, routeOptions]);
 
+  const selectedSegments: RouteSegment[] = useMemo(() => {
+    if (!selectedRouteOptionKey) return [];
+    return routeOptions[selectedRouteOptionKey]?.segments || [];
+  }, [selectedRouteOptionKey, routeOptions]);
+
+  const timeBreakdown = useMemo(() => {
+    if (!selectedSegments.length) return null;
+
+    const segmentSeconds = (seg: RouteSegment): number | undefined => {
+      const from = seg.fromDepartureTime ?? seg.departTime;
+      const to = seg.toArrivalTime ?? seg.arriveTime;
+      const fromTo = diffSecondsFromApiTimes(from, to);
+      if (fromTo !== undefined) return fromTo;
+      return parseHumanDurationSeconds(seg.estimatedDuration);
+    };
+
+    let walkSeconds = 0;
+    let transitSeconds = 0;
+    let waitingSeconds = 0;
+    let hadAny = false;
+
+    for (const seg of selectedSegments) {
+      const sec = segmentSeconds(seg);
+      if (sec !== undefined) {
+        hadAny = true;
+        if (seg.mode === 'walk') walkSeconds += sec;
+        else if (seg.mode === 'transit') transitSeconds += sec;
+        else transitSeconds += sec;
+      }
+
+      if (seg.mode === 'transit') {
+        const w = parseColonDurationSeconds(seg.waitingTime);
+        if (w !== undefined) {
+          hadAny = true;
+          waitingSeconds += w;
+        }
+      }
+    }
+
+    if (!hadAny) return null;
+    const totalSeconds = walkSeconds + transitSeconds + waitingSeconds;
+    return { totalSeconds, transitSeconds, walkSeconds, waitingSeconds };
+  }, [selectedSegments]);
+
   const getOptionAccent = (k: RouteOptionKey | undefined) => {
     if (k === '2') return { text: 'text-pink-700', border: 'border-pink-700', chipBg: 'bg-pink-100 dark:bg-pink-900/30' };
     if (k === '3') return { text: 'text-green-600', border: 'border-green-600', chipBg: 'bg-green-50 dark:bg-green-900/20' };
     return { text: 'text-blue-600', border: 'border-blue-600', chipBg: 'bg-blue-50 dark:bg-blue-900/20' };
   };
 
-  const renderLegRow = (seg: RouteSegment, idx: number, total: number, accent: { text: string; border: string; chipBg: string }) => {
+  const getLegStopNames = (seg: RouteSegment): string[] => {
+    const fromName = String(seg.fromName || '').trim();
+    const toName = String(seg.toName || '').trim();
+    const mid = Array.isArray(seg.intermediateStops) ? seg.intermediateStops : [];
+    const midNames = mid.map(s => String(s?.name || '').trim()).filter(Boolean);
+
+    const out: string[] = [];
+    const push = (name: string) => {
+      if (!name) return;
+      const last = out[out.length - 1];
+      if (last && last.toLowerCase() === name.toLowerCase()) return;
+      out.push(name);
+    };
+
+    push(fromName);
+    for (const n of midNames) push(n);
+    push(toName);
+    return out;
+  };
+
+  const AlwaysOpenPopupMarker = (props: {
+    position: [number, number];
+    icon: any;
+    text: string;
+  }) => {
+    const markerRef = useRef<L.Marker | null>(null);
+
+    useEffect(() => {
+      const m = markerRef.current;
+      if (!m) return;
+      try {
+        m.openPopup();
+      } catch {
+        // ignore
+      }
+    }, [props.position[0], props.position[1], props.text]);
+
+    return (
+      <Marker position={props.position} icon={props.icon} ref={markerRef as any}>
+        <Popup className="stop-name-popup" autoClose={false} closeOnClick={false} closeButton={false}>
+          <div className="stop-name-popup__text">{props.text}</div>
+        </Popup>
+      </Marker>
+    );
+  };
+
+  const renderLegRow = (
+    seg: RouteSegment,
+    idx: number,
+    total: number,
+    _accent: { text: string; border: string; chipBg: string },
+    optionKey: RouteOptionKey
+  ) => {
     const fromTo = seg.fromName && seg.toName ? `${seg.fromName} → ${seg.toName}` : (seg.fromName || seg.toName || '');
-    const modeLabel = seg.mode === 'transit' ? 'Transit' : seg.mode === 'walk' ? 'Walk' : 'Leg';
+    const transitModeLabel = seg.mode === 'transit' ? routeTypeToModeName(seg.routeType) : undefined;
+    const modeLabel = seg.mode === 'transit' ? (transitModeLabel || 'Transit') : seg.mode === 'walk' ? 'Walk' : 'Leg';
     const head = fromTo || seg.label || modeLabel;
 
     const duration = (seg.estimatedDuration || '').trim();
     const distance = (seg.estimatedDistance || '').trim();
-    const depart = formatApiDateTimeTo12(seg.departTime);
-    const arrive = formatApiDateTimeTo12(seg.arriveTime);
+    const depart = formatApiDateTimeTo12(seg.fromDepartureTime ?? seg.departTime);
+    const arrive = formatApiDateTimeTo12(seg.toArrivalTime ?? seg.arriveTime);
+    const waitText = formatWaitTime(seg.waitingTime);
+
+    const isExpanded = expandedLeg?.optionKey === optionKey && expandedLeg?.idx === idx;
+    const stopNames = getLegStopNames(seg);
 
     const isWalk = seg.mode === 'walk';
-    const stepAccent = isWalk
-      ? { text: 'text-orange-600', border: 'border-orange-500', chipBg: 'bg-orange-50 dark:bg-orange-900/20' }
-      : accent;
 
-    const chipText =
-      seg.mode === 'transit'
-        ? (seg.label ? `${modeLabel} • ${seg.label}` : modeLabel)
-        : modeLabel;
+    const normalizedRouteColor = normalizeHexRouteColor(seg.color);
+    const legColor = isWalk
+      ? 'orange'
+      : (normalizedRouteColor || String(seg.color || '').trim() || ROUTE_OPTION_COLORS[optionKey] || 'blue');
+
+    const chipText = (() => {
+      if (seg.mode !== 'transit') return modeLabel;
+      const modeName = transitModeLabel || modeLabel;
+      const label = String(seg.label || '').trim();
+      if (!label) return modeName;
+      if (label.toLowerCase() === modeName.toLowerCase()) return modeName;
+      return `${modeName} • ${label}`;
+    })();
+
+    const chipClassName =
+      'inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold bg-gray-100 dark:bg-gray-800/60 border border-gray-200 dark:border-gray-700';
+
+    const chipStyle: React.CSSProperties | undefined = { color: legColor, borderColor: legColor };
 
     return (
-      <div key={`leg-${idx}-${head}`} className="py-2">
+      <div key={`leg-${optionKey}-${idx}-${head}`} className="py-2">
+        <button
+          type="button"
+          onClick={() => setExpandedLeg((prev) => (prev?.optionKey === optionKey && prev?.idx === idx ? null : { optionKey, idx }))}
+          className="w-full text-left"
+        >
         <div className="flex gap-3">
           <div className="flex flex-col items-center pt-0.5">
             <div
-              className={`w-6 h-6 rounded-full border ${stepAccent.border} ${stepAccent.text} flex items-center justify-center text-[11px] font-semibold bg-white dark:bg-gray-900`}
+              className="w-6 h-6 rounded-full border flex items-center justify-center text-[11px] font-semibold bg-white dark:bg-gray-900"
+              style={{ borderColor: legColor, color: legColor }}
             >
               {idx + 1}
             </div>
             {idx < total - 1 && (
-              <div className="w-px flex-1 bg-gray-200 dark:bg-gray-700 mt-1" />
+              <div className="w-px flex-1 mt-1" style={{ backgroundColor: legColor, opacity: 0.35 }} />
             )}
           </div>
 
           <div className="min-w-0 flex-1">
-            <div className="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">
+            <div className="text-sm font-medium text-gray-900 dark:text-gray-100 break-words">
               {head}
             </div>
+
+            {(depart || arrive || waitText) && (
+              <div className="mt-1 text-xs text-gray-800 dark:text-gray-200">
+                {(depart || arrive) && (
+                  <div className="font-semibold">
+                    {depart || '—'} → {arrive || '—'}
+                  </div>
+                )}
+                {waitText && (
+                  <div className="text-[11px] font-medium text-gray-700 dark:text-gray-200">
+                    Wait {waitText}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {(duration || distance) && (
+              <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-gray-600 dark:text-gray-300">
+                {duration && <span>{duration}</span>}
+                {distance && <span>{distance}</span>}
+              </div>
+            )}
+
             <div className="mt-1 flex flex-wrap items-center gap-2">
-              <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold ${stepAccent.chipBg} ${stepAccent.text}`}>
+              <span
+                className="inline-block h-2.5 w-2.5 rounded-full border border-white dark:border-gray-900"
+                style={{ backgroundColor: legColor }}
+                aria-hidden="true"
+              />
+              <span className={chipClassName} style={chipStyle}>
                 {chipText}
               </span>
             </div>
           </div>
 
-          <div className="shrink-0 text-right">
-            {(depart || arrive) && (
-              <div className="text-xs font-semibold text-gray-900 dark:text-gray-100">
-                {depart || '—'} → {arrive || '—'}
-              </div>
-            )}
-            {duration && <div className="text-xs text-gray-600 dark:text-gray-300">{duration}</div>}
-            {distance && <div className="text-xs text-gray-600 dark:text-gray-300">{distance}</div>}
+          <div className="shrink-0 pt-0.5 text-gray-500 dark:text-gray-400">
+            {isExpanded ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
           </div>
         </div>
+        </button>
+
+        {isExpanded && stopNames.length > 0 && (
+          <div className="mt-2 ml-9 rounded-md border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 px-3 py-2">
+            <div className="text-[11px] font-semibold text-gray-700 dark:text-gray-200 mb-1">Stops</div>
+            <div className="space-y-1">
+              {stopNames.map((name, i) => (
+                <div key={`leg-stop-${optionKey}-${idx}-${i}`} className="flex items-start gap-2">
+                  <span className="mt-[6px] inline-block h-1.5 w-1.5 rounded-full" style={{ backgroundColor: legColor, opacity: 0.75 }} />
+                  <div className="text-xs text-gray-800 dark:text-gray-100 break-words">{name}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     );
   };
@@ -1945,7 +2345,7 @@ export function RoutePlanning() {
           overflow-hidden
         `}
       >
-        <div className="h-full p-6 overflow-y-auto">
+        <div className="h-full p-4 sm:p-6 overflow-y-auto">
           <div className="pt-12 md:pt-0">
             <div className="flex items-center justify-between mb-4">
               <button
@@ -2205,31 +2605,54 @@ export function RoutePlanning() {
                 </div>
 
                 <div>
-                  <label className="block text-xs font-medium text-gray-600 dark:text-gray-300 mb-2">Disallowed route types</label>
+                  <div className="flex items-center justify-between mb-2">
+                    <label className="block text-xs font-medium text-gray-600 dark:text-gray-300">Disallowed route types</label>
+                    <button
+                      type="button"
+                      onClick={fetchCityRouteTypes}
+                      className="text-[11px] font-semibold text-blue-600 dark:text-blue-400 hover:underline"
+                    >
+                      {routeTypesLoading ? 'Loading…' : (availableRouteTypes.length ? 'Refresh' : 'Load')}
+                    </button>
+                  </div>
                   <div className="rounded-md border border-gray-200 dark:border-gray-700 p-2 bg-gray-50 dark:bg-gray-800">
-                    <div className="grid grid-cols-2 gap-2">
-                      {[
-                        { key: 'bus', label: 'Bus' },
-                        { key: 'metro', label: 'Metro' },
-                        { key: 'ferry', label: 'Ferry' },
-                        { key: 'tram', label: 'Tram' },
-                      ].map(opt => (
-                        <label key={opt.key} className="inline-flex items-center gap-2 text-sm text-gray-800 dark:text-gray-200">
-                          <input
-                            type="checkbox"
-                            checked={disallowedModes.includes(opt.key)}
-                            onChange={(e) => {
-                              setDisallowedModes(prev => e.target.checked ? [...prev, opt.key] : prev.filter(k => k !== opt.key));
-                            }}
-                            className="h-4 w-4 text-blue-600 border-gray-300 rounded"
-                          />
-                          <span className="lowercase first-letter:uppercase">{opt.label}</span>
-                        </label>
-                      ))}
-                    </div>
+                    {routeTypesError && (
+                      <div className="text-xs text-red-600 dark:text-red-400 mb-2">
+                        {routeTypesError}
+                      </div>
+                    )}
+
+                    {routeTypesLoading ? (
+                      <div className="text-xs text-gray-600 dark:text-gray-300 py-2">Loading route types…</div>
+                    ) : availableRouteTypes.length ? (
+                      <div className="grid grid-cols-2 gap-2">
+                        {availableRouteTypes.map((opt) => (
+                          <label key={opt.mode} className="inline-flex items-start gap-2 text-sm text-gray-800 dark:text-gray-200">
+                            <input
+                              type="checkbox"
+                              checked={disallowedModes.includes(opt.mode)}
+                              onChange={(e) => {
+                                setDisallowedModes(prev => e.target.checked ? [...prev, opt.mode] : prev.filter(k => k !== opt.mode));
+                              }}
+                              className="mt-0.5 h-4 w-4 text-blue-600 border-gray-300 rounded"
+                            />
+                            <div className="min-w-0">
+                              <div className="lowercase first-letter:uppercase leading-tight">{opt.label}</div>
+                              <div className="text-[11px] text-gray-500 dark:text-gray-400">{opt.route_count} routes</div>
+                            </div>
+                          </label>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="text-xs text-gray-600 dark:text-gray-300 py-2">
+                        Click “Load” to fetch available route types for this city.
+                      </div>
+                    )}
                   </div>
                 </div>
 
+                {/* Walking time limit + Waiting time limit intentionally disabled */}
+                {/**
                 <div className="grid grid-cols-2 gap-3">
                   <div>
                     <label className="block text-xs font-medium text-gray-600 dark:text-gray-300 mb-1">Walking time limit (min)</label>
@@ -2254,6 +2677,7 @@ export function RoutePlanning() {
                     />
                   </div>
                 </div>
+                */}
                 <div className="grid grid-cols-2 gap-3">
                   <label className="inline-flex items-center gap-2 text-sm text-gray-800 dark:text-gray-200">
                     <input
@@ -2416,7 +2840,7 @@ export function RoutePlanning() {
             <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500"></div>
           </div>
         )}
-        <div className="absolute top-4 right-4 z-[1000] flex flex-col gap-3 w-[22rem] max-w-[calc(100vw-2rem)] pointer-events-auto">
+        <div className="absolute top-4 right-4 z-[1000] flex flex-col gap-3 w-[calc(100vw-2rem)] sm:w-[22rem] max-w-[calc(100vw-2rem)] pointer-events-auto">
           {serverError && (
             <div className="bg-red-50 border border-red-200 text-red-700 rounded-lg px-3 py-2 text-sm shadow">
               {serverError}
@@ -2471,19 +2895,19 @@ export function RoutePlanning() {
                     <div className="mt-2 flex flex-wrap gap-3 text-xs text-gray-700 dark:text-gray-300">
                       {routeOptionKeys.includes('1') && (
                         <div className="flex items-center gap-2">
-                          <span className="inline-block h-2 w-2 rounded-full bg-blue-600" />
+                          <span className="inline-block h-2 w-2 rounded-full bg-black" />
                           Option 1
                         </div>
                       )}
                       {routeOptionKeys.includes('2') && (
                         <div className="flex items-center gap-2">
-                          <span className="inline-block h-2 w-2 rounded-full bg-pink-700" />
+                          <span className="inline-block h-2 w-2 rounded-full bg-black" />
                           Option 2
                         </div>
                       )}
                       {routeOptionKeys.includes('3') && (
                         <div className="flex items-center gap-2">
-                          <span className="inline-block h-2 w-2 rounded-full bg-green-600" />
+                          <span className="inline-block h-2 w-2 rounded-full bg-black" />
                           Option 3
                         </div>
                       )}
@@ -2496,12 +2920,25 @@ export function RoutePlanning() {
                 <div className="mb-4">
                   <h2 className="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">Estimated Trip</h2>
                   <div className="flex flex-wrap gap-4 text-sm text-gray-800 dark:text-gray-200">
-                    <div className="flex items-center"><Clock size={16} className="mr-2" />{routeInfo.estimated_duration}</div>
                     <div className="flex items-center"><RouteIcon size={16} className="mr-2" />{routeInfo.total_distance}</div>
                     {etaString && (
                       <div className="flex items-center"><Clock size={16} className="mr-2" />ETA {etaString}</div>
                     )}
                   </div>
+                  {timeBreakdown && (
+                    <div className="mt-2 text-xs text-gray-700 dark:text-gray-300">
+                      {(() => {
+                        const parts: string[] = [];
+                        const travel = formatDurationBrief(timeBreakdown.transitSeconds);
+                        const walk = formatDurationBrief(timeBreakdown.walkSeconds);
+                        const wait = formatDurationBrief(timeBreakdown.waitingSeconds);
+                        if (travel) parts.push(`Travel ${travel}`);
+                        if (walk) parts.push(`Walk ${walk}`);
+                        if (wait) parts.push(`Wait ${wait}`);
+                        return parts.join(' • ');
+                      })()}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -2530,11 +2967,11 @@ export function RoutePlanning() {
                         return (
                           <div key={`legs-${k}`}>
                             <div className="flex items-center gap-2 mb-1">
-                              <span className={`inline-block h-2 w-2 rounded-full ${k === '1' ? 'bg-blue-600' : k === '2' ? 'bg-pink-700' : 'bg-green-600'}`} />
+                              <span className="inline-block h-2 w-2 rounded-full bg-black" />
                               <div className={`text-xs font-semibold ${accent.text}`}>Option {k}</div>
                             </div>
                             <div className="rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 px-2">
-                              {segs.map((s, idx) => renderLegRow(s, idx, segs.length, accent))}
+                              {segs.map((s, idx) => renderLegRow(s, idx, segs.length, accent, k))}
                             </div>
                           </div>
                         );
@@ -2547,7 +2984,7 @@ export function RoutePlanning() {
                       const accent = getOptionAccent(k);
                       return (
                         <div className="rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 px-2">
-                          {segs.length ? segs.map((s, idx) => renderLegRow(s, idx, segs.length, accent)) : (
+                          {segs.length && k ? segs.map((s, idx) => renderLegRow(s, idx, segs.length, accent, k)) : (
                             <div className="text-xs text-gray-600 dark:text-gray-300 py-2">No legs available for this option.</div>
                           )}
                         </div>
@@ -2592,6 +3029,35 @@ export function RoutePlanning() {
             maxZoom={20}
           />
           <ClickCatcher />
+          {mapContextMenu && (
+            <Popup
+              key={`ctx-${mapContextMenu.lat.toFixed(6)}-${mapContextMenu.lon.toFixed(6)}`}
+              position={[mapContextMenu.lat, mapContextMenu.lon]}
+            >
+              <div className="text-xs">
+                <div className="font-semibold mb-2">Set point</div>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => applyMapPoint('source', mapContextMenu.lat, mapContextMenu.lon)}
+                    className="px-2 py-1 rounded-md bg-green-600 text-white hover:bg-green-700"
+                  >
+                    Use as Source
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => applyMapPoint('dest', mapContextMenu.lat, mapContextMenu.lon)}
+                    className="px-2 py-1 rounded-md bg-red-600 text-white hover:bg-red-700"
+                  >
+                    Use as Destination
+                  </button>
+                </div>
+                <div className="mt-2 text-[11px] text-gray-600">
+                  {mapContextMenu.lat.toFixed(6)}, {mapContextMenu.lon.toFixed(6)}
+                </div>
+              </div>
+            </Popup>
+          )}
           {fitBoundsInfo && (
             <FitBoundsController points={fitBoundsInfo.points} boundsKey={fitBoundsInfo.key} />
           )}
@@ -2643,7 +3109,6 @@ export function RoutePlanning() {
                       if (ends.start) {
                         const a: [number, number] = [source.lat as number, source.lon as number];
                         const b: [number, number] = ends.start;
-                        const mid = midpoint(a, b);
                         items.push(
                           <Polyline
                             key={`connector-${k}-start`}
@@ -2654,20 +3119,10 @@ export function RoutePlanning() {
                             pathOptions={walkConnectorStyle}
                           />
                         );
-                        if (mid) {
-                          items.push(
-                            <Marker
-                              key={`connector-${k}-start-flag`}
-                              position={mid}
-                              icon={makeLegFlagIcon('WALK', 'Walk', 'orange')}
-                            />
-                          );
-                        }
                       }
                       if (ends.end) {
                         const a: [number, number] = ends.end;
                         const b: [number, number] = [dest.lat as number, dest.lon as number];
-                        const mid = midpoint(a, b);
                         items.push(
                           <Polyline
                             key={`connector-${k}-end`}
@@ -2678,15 +3133,6 @@ export function RoutePlanning() {
                             pathOptions={walkConnectorStyle}
                           />
                         );
-                        if (mid) {
-                          items.push(
-                            <Marker
-                              key={`connector-${k}-end-flag`}
-                              position={mid}
-                              icon={makeLegFlagIcon('WALK', 'Walk', 'orange')}
-                            />
-                          );
-                        }
                       }
                       return items;
                     })}
@@ -2711,6 +3157,9 @@ export function RoutePlanning() {
                     }
                   }
 
+                  const firstStopId = segs.find(s => s.fromStopId && s.fromCoord && s.fromName)?.fromStopId;
+                  const lastStopId = [...segs].reverse().find(s => s.toStopId && s.toCoord && s.toName)?.toStopId;
+
                   return [
                     ...segs.flatMap((s, idx) => {
                     const baseKey = `route-option-${k}-seg-${idx}`;
@@ -2729,17 +3178,45 @@ export function RoutePlanning() {
                       />
                     ));
 
+                    if (s.mode === 'transit' && s.intermediateStops?.length) {
+                      for (let stopIdx = 0; stopIdx < s.intermediateStops.length; stopIdx++) {
+                        const st = s.intermediateStops[stopIdx];
+                        items.push(
+                          <CircleMarker
+                            key={`${baseKey}-midstop-${stopIdx}-${st.coord[0]}-${st.coord[1]}`}
+                            center={st.coord}
+                            radius={6}
+                            pathOptions={{
+                              color: '#ffffff',
+                              fillColor: segColor,
+                              fillOpacity: 0.9,
+                              weight: 2,
+                              className: 'intermediate-stop-dot',
+                            }}
+                          >
+                            <Tooltip direction="top" offset={[0, -8]} opacity={1}>
+                              <div className="text-xs">
+                                <div className="font-semibold">{st.name}</div>
+                              </div>
+                            </Tooltip>
+                          </CircleMarker>
+                        );
+                      }
+                    }
+
                     if (s.mode === 'transit' && s.anchor) {
+                      const modeName = routeTypeToModeName(s.routeType);
+                      const tag = routeTypeToTag(s.routeType);
                       items.push(
                         <Marker
                           key={`${baseKey}-flag`}
                           position={s.anchor}
-                          icon={makeLegFlagIcon('TRANSIT', s.label || 'Transit', segColor)}
+                          icon={makeLegFlagIcon(tag, s.label || '', segColor)}
                         >
                           <Popup>
                             <div className="text-xs">
-                              <div className="font-semibold">Transit</div>
-                              <div>{s.label || 'Transit'}</div>
+                              <div className="font-semibold">{modeName}</div>
+                              <div>{s.label || modeName}</div>
                               <div className="text-gray-600">Option {k}</div>
                             </div>
                           </Popup>
@@ -2765,18 +3242,12 @@ export function RoutePlanning() {
                     return items;
                   }),
                     ...Array.from(stopPins.entries()).map(([stopId, v]) => (
-                      <Marker
+                      <AlwaysOpenPopupMarker
                         key={`stop-pin-${k}-${stopId}`}
                         position={v.coord}
-                        icon={legPinIcon}
-                      >
-                        <Tooltip direction="top" offset={[0, -20]} opacity={1}>
-                          <div className="text-xs">
-                            <div className="font-semibold">{stopId}</div>
-                            <div>{v.name}</div>
-                          </div>
-                        </Tooltip>
-                      </Marker>
+                        icon={stopId === firstStopId ? startIcon : stopId === lastStopId ? endIcon : legPinIcon}
+                        text={v.name}
+                      />
                     )),
                   ];
                 })}
@@ -2796,7 +3267,6 @@ export function RoutePlanning() {
                       if (ends.start) {
                         const a: [number, number] = [source.lat as number, source.lon as number];
                         const b: [number, number] = ends.start;
-                        const mid = midpoint(a, b);
                         items.push(
                           <Polyline
                             key={`connector-${k}-start`}
@@ -2807,20 +3277,10 @@ export function RoutePlanning() {
                             pathOptions={walkConnectorStyle}
                           />
                         );
-                        if (mid) {
-                          items.push(
-                            <Marker
-                              key={`connector-${k}-start-flag`}
-                              position={mid}
-                              icon={makeLegFlagIcon('WALK', 'Walk', 'orange')}
-                            />
-                          );
-                        }
                       }
                       if (ends.end) {
                         const a: [number, number] = ends.end;
                         const b: [number, number] = [dest.lat as number, dest.lon as number];
-                        const mid = midpoint(a, b);
                         items.push(
                           <Polyline
                             key={`connector-${k}-end`}
@@ -2831,15 +3291,6 @@ export function RoutePlanning() {
                             pathOptions={walkConnectorStyle}
                           />
                         );
-                        if (mid) {
-                          items.push(
-                            <Marker
-                              key={`connector-${k}-end-flag`}
-                              position={mid}
-                              icon={makeLegFlagIcon('WALK', 'Walk', 'orange')}
-                            />
-                          );
-                        }
                       }
                       return items;
                     })()}
@@ -2854,6 +3305,9 @@ export function RoutePlanning() {
                           stopPins.set(s.toStopId, { coord: s.toCoord, name: s.toName });
                         }
                       }
+
+                      const firstStopId = segs.find(s => s.fromStopId && s.fromCoord && s.fromName)?.fromStopId;
+                      const lastStopId = [...segs].reverse().find(s => s.toStopId && s.toCoord && s.toName)?.toStopId;
 
                       return (
                         <>
@@ -2874,17 +3328,45 @@ export function RoutePlanning() {
                         />
                       ));
 
+                      if (s.mode === 'transit' && s.intermediateStops?.length) {
+                        for (let stopIdx = 0; stopIdx < s.intermediateStops.length; stopIdx++) {
+                          const st = s.intermediateStops[stopIdx];
+                          items.push(
+                            <CircleMarker
+                              key={`${baseKey}-midstop-${stopIdx}-${st.coord[0]}-${st.coord[1]}`}
+                              center={st.coord}
+                              radius={6}
+                              pathOptions={{
+                                color: '#ffffff',
+                                fillColor: segColor,
+                                fillOpacity: 0.9,
+                                weight: 2,
+                                className: 'intermediate-stop-dot',
+                              }}
+                            >
+                              <Tooltip direction="top" offset={[0, -8]} opacity={1}>
+                                <div className="text-xs">
+                                  <div className="font-semibold">{st.name}</div>
+                                </div>
+                              </Tooltip>
+                            </CircleMarker>
+                          );
+                        }
+                      }
+
                       if (s.mode === 'transit' && s.anchor) {
+                        const modeName = routeTypeToModeName(s.routeType);
+                        const tag = routeTypeToTag(s.routeType);
                         items.push(
                           <Marker
                             key={`${baseKey}-flag`}
                             position={s.anchor}
-                            icon={makeLegFlagIcon('TRANSIT', s.label || 'Transit', segColor)}
+                            icon={makeLegFlagIcon(tag, s.label || '', segColor)}
                           >
                             <Popup>
                               <div className="text-xs">
-                                <div className="font-semibold">Transit</div>
-                                <div>{s.label || 'Transit'}</div>
+                                <div className="font-semibold">{modeName}</div>
+                                <div>{s.label || modeName}</div>
                                 <div className="text-gray-600">Option {k}</div>
                               </div>
                             </Popup>
@@ -2911,18 +3393,12 @@ export function RoutePlanning() {
                           })}
 
                           {Array.from(stopPins.entries()).map(([stopId, v]) => (
-                            <Marker
+                            <AlwaysOpenPopupMarker
                               key={`stop-pin-${k}-${stopId}`}
                               position={v.coord}
-                              icon={legPinIcon}
-                            >
-                              <Tooltip direction="top" offset={[0, -20]} opacity={1}>
-                                <div className="text-xs">
-                                  <div className="font-semibold">{stopId}</div>
-                                  <div>{v.name}</div>
-                                </div>
-                              </Tooltip>
-                            </Marker>
+                              icon={stopId === firstStopId ? startIcon : stopId === lastStopId ? endIcon : legPinIcon}
+                              text={v.name}
+                            />
                           ))}
                         </>
                       );
@@ -2931,11 +3407,7 @@ export function RoutePlanning() {
                 );
               })()
             )
-          ) : (
-            straightPath.length > 0 && (
-              <Polyline positions={straightPath} pathOptions={{ color: 'gray', weight: 4, opacity: 0.8 }} />
-            )
-          )}
+          ) : null}
           {showNearbyStops && nearbyAnchor && (
             <>
               <Circle

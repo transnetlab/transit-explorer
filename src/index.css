@@ -4,4 +4,51 @@
 
 /* Dark mode base transitions */
 html { scroll-behavior: smooth; }
-body { transition: background-color .3s, color .3s; }
+body { transition: background-color .3s, color .3s; overflow-x: hidden; }
+
+/* Route planning: intermediate stop dots (Leaflet SVG paths) */
+.intermediate-stop-dot {
+	transform-origin: center;
+	animation: intermediate-stop-pulse 2.4s ease-in-out infinite;
+}
+
+@keyframes intermediate-stop-pulse {
+	0% {
+		opacity: 1;
+		stroke-width: 1;
+	}
+	50% {
+		opacity: 0.35;
+		stroke-width: 8;
+	}
+	100% {
+		opacity: 1;
+		stroke-width: 1;
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.intermediate-stop-dot {
+		animation: none;
+	}
+}
+
+/* Compact always-open stop-name popups (Route Planning) */
+.stop-name-popup .leaflet-popup-content-wrapper {
+	padding: 2px 4px;
+	border-radius: 6px;
+}
+
+.stop-name-popup .leaflet-popup-content {
+	margin: 0;
+}
+
+.stop-name-popup__text {
+	font-size: 10px;
+	line-height: 1.1;
+	font-weight: 700;
+}
+
+.stop-name-popup .leaflet-popup-tip {
+	display: none;
+}

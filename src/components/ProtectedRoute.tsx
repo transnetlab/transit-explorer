@@ -10,7 +10,13 @@ export function ProtectedRoute({ children, allowDefaultCities = false }: Protect
   const isAuthenticated = localStorage.getItem('isAuthenticated') === 'true';
   const { city } = useParams();
 
-  const isDefaultCity = city === 'bangalore' || city === 'paris' || city === 'austin' || city === 'dharwad';
+  const isDefaultCity =
+    city === 'bangalore' ||
+    city === 'paris' ||
+    city === 'austin' ||
+    city === 'sydney' ||
+    city === 'colombia' ||
+    city === 'dharwad';
 
   if (!isAuthenticated && !(allowDefaultCities && isDefaultCity)) {
     return <Navigate to="/signin" replace />;
